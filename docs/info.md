@@ -1,3 +1,5 @@
+# Appendix: Walloon consumption data notes
+
 La CWaPE (Wallonie) publie trimestriellement des données sur la consommation d'électricité. Un ménage wallon moyen consomme environ 3 500 kWh/an, mais ce chiffre varie de 600 kWh (petit appartement) à plus de 7 500 kWh (grand logement avec chauffage électrique). Les chiffres clés incluent la consommation par commune, le type de compteur et le photovoltaïque. 
 
 Voici un résumé des données de consommation d'électricité (source : CWaPE/TotalEnergies) : 

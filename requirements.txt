@@ -1,0 +1,12 @@
+# Digital twin / power flow (versions pinned from the working "bressoux" environment)
+pandas==2.3.3
+pandapower==3.4.0
+plotly==6.6.0
+matplotlib==3.10.8
+scikit-learn  
+
+# Documentation (Sphinx, built from docs/)
+sphinx
+myst-parser
+sphinx-rtd-theme
+sphinxcontrib-mermaid
