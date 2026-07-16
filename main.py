@@ -1,19 +1,33 @@
+import os
+
 import pandas as pd
 
 from sourcecode.digital_twin import run_digital_twin
 
 DATA_PATH = "data/"
 
+
+def _read_csv_if_exists(path, **kwargs):
+    """v1: pv_profiles / schedules_BSS / config are optional inputs — if the
+    file isn't there yet, fall back to None rather than crash (run_digital_twin
+    handles config=None via defaults, and ignores pv_profiles/schedules_BSS)."""
+    return pd.read_csv(path, **kwargs) if os.path.exists(path) else None
+
+
 if __name__ == "__main__":
 
-    config = pd.read_csv(DATA_PATH + "config.csv")
+    config = _read_csv_if_exists(DATA_PATH + "config.csv")
     households = pd.read_csv(DATA_PATH + "households.csv")
-    load_profiles = pd.read_csv(DATA_PATH + "load_profiles.csv")
-    pv_profiles = pd.read_csv(DATA_PATH + "pv_profiles.csv")
-    schedules_BSS = pd.read_csv(DATA_PATH + "schedules_BSS.csv")
+    load_profiles = pd.read_csv(DATA_PATH + "load_profiles.csv", index_col=0)
+    pv_profiles = _read_csv_if_exists(DATA_PATH + "pv_profiles.csv")
+    schedules_BSS = _read_csv_if_exists(DATA_PATH + "schedules_BSS.csv")
 
     out = run_digital_twin(config, households, load_profiles, pv_profiles, schedules_BSS)
-    
+
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.width", 160)
+    print(out)
+
 """
 The function `run_digital_twin` is defined in digital_twin.py inside sourcecode folder.
 The function is to be introduced in communication_agents.py within the MAS4TE framework.
