@@ -22,11 +22,34 @@ if __name__ == "__main__":
     pv_profiles = _read_csv_if_exists(DATA_PATH + "pv_profiles.csv")
     schedules_BSS = _read_csv_if_exists(DATA_PATH + "schedules_BSS.csv")
 
-    out = run_digital_twin(config, households, load_profiles, pv_profiles, schedules_BSS)
+    # --- Stress test : charges nominales vs x3 ---
+    # Canal unique de mise a l'echelle : config['load_scale'], applique par
+    # run_digital_twin apres construction de load_profiles (quel que soit
+    # methode_affectation). Remplace l'ancienne multiplication de
+    # load_profiles en amont, qui ne stressait que la methode "actuelle" et
+    # laissait "banque_mensuelle" insensible a tout scenario de stress.
+    config_x3 = {'load_scale': 3}
 
+    out_normal = run_digital_twin(config, households, load_profiles,
+                                  pv_profiles, schedules_BSS)
+    out_x3    = run_digital_twin(config_x3, households, load_profiles,
+                                  pv_profiles, schedules_BSS)
+
+    # --- Comparaison des verdicts ---
+    for name, result in [("x1", out_normal), ("x3", out_x3)]:
+        valid = result[(result.category=='summary') &
+                       (result.metric=='network_valid')]['value'].iloc[0]
+        minv  = result[(result.category=='summary') &
+                       (result.metric=='min_voltage_pu')]['value'].iloc[0]
+        print(f"{name:<4} -> viable : {valid}, tension min : {minv}")
+
+    # --- Détail complet du cas nominal ---
     pd.set_option("display.max_rows", None)
     pd.set_option("display.width", 160)
-    print(out)
+    print("\n--- Détail cas nominal ---")
+    print(out_normal)
+    print("\n--- Détail cas x3 ---")
+    print(out_x3)
 
 """
 The function `run_digital_twin` is defined in digital_twin.py inside sourcecode folder.

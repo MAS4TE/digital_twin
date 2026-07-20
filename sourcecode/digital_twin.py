@@ -35,8 +35,8 @@ from pandapower.timeseries import DFData, OutputWriter, run_timeseries
 #   scenarios; NOT exposed to the MAS4TE caller via `config`)
 # ============================================================
 RANDOM_SEED = 369
-SHIFT_MAX_STEPS = 8        # load foisonnement: time shift +/- 8 steps (+/- 2h)
-SCALE_SIGMA = 0.2          # load amplitude dispersion: lognormal sigma (~20%)
+SHIFT_MAX_STEPS = 8        # load foisonnement: standard : # time shift +/- 8 steps (+/- 2h)
+SCALE_SIGMA = 0.2          # load amplitude dispersion: standard 0.2 (~20%)
 # (!) v1 : _assign_loads reproduit le comportement actuel de power_flow.ipynb
 # (tirage direct dans la banque de profils déjà perturbée), donc ces deux
 # constantes ne sont pas encore appliquées. Gardées ici pour une future
@@ -44,6 +44,17 @@ SCALE_SIGMA = 0.2          # load amplitude dispersion: lognormal sigma (~20%)
 
 STEPS_PER_DAY = 96         # 15-min steps
 STEPS_PER_WEEK = 672
+
+# Index temporel hebdo 'Mon 00:00'..'Sun 23:45' -- identique a celui produit
+# par profil_conso.ipynb pour load_profiles.csv. Reutilise par
+# _build_load_profiles_banque_mensuelle pour que le load_profiles construit
+# a partir de la banque de vraies semaines ait EXACTEMENT le meme index.
+_WEEK_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+_WEEK_TIME_INDEX = [
+    f"{_WEEK_DAYS[step // STEPS_PER_DAY]} "
+    f"{(step % STEPS_PER_DAY) * 15 // 60:02d}:{(step % STEPS_PER_DAY) * 15 % 60:02d}"
+    for step in range(STEPS_PER_WEEK)
+]
 
 # Câbles (validés / power_flow.ipynb) — pas dans le squelette d'origine,
 # nécessaires pour dimensionner électriquement les lignes.
@@ -56,7 +67,7 @@ MV_CABLE = dict(r_ohm_per_km=0.313, x_ohm_per_km=0.132, c_nf_per_km=216.0, max_i
 # Poste source (slack) — coordonnées réelles + tension calée sur la moyenne
 # mesurée par les compteurs réels (measure_ph1/2/3, ~236.9 V -> ~1.026 pu).
 SLACK_COORDS = (5.610327685729984, 50.64764449828147)  # (lon, lat)
-SLACK_VM_PU = 1.03
+SLACK_VM_PU = 1.03          #Standard 1.03 pu
 
 # MV network topology (fixed — real Bressoux network).
 # Substations = MV nodes WITH transformer + LV secondary; feed the loads.
@@ -153,6 +164,44 @@ CABINE_STREET_SEGMENTS = [
     ("GROTTES",            "Plateau du Bouhay",    "odd",  None,  None),
     ("GROTTES",            "Plateau du Bouhay",    "even", None,  None),
 ]
+
+# ============================================================
+#  Load assignment method B ("banque_mensuelle") — additions (integrate-bank-B)
+#  cf. explore_seasonal_pv.py (branche explore-seasonal-pv) : banque de
+#  vraies semaines EAN (672 pas), segmentee par mois, materialisee par
+#  sourcecode/consumption_bank.py. Coexiste avec la methode "actuelle"
+#  (_assign_loads) — selectionnable via config['methode_affectation'],
+#  defaut "actuelle" (comportement inchange tant que non selectionne).
+# ============================================================
+CONSUMPTION_BANK_FILE = "consumption_bank_real_weeks.parquet"
+BANK_JITTER_STEPS = [-2, -1, 1, 2]  # +/- 15-30 min, uniquement sur doublons
+
+_MONTH_NAMES_FR = {
+    "janvier": 1, "fevrier": 2, "février": 2, "mars": 3, "avril": 4, "mai": 5,
+    "juin": 6, "juillet": 7, "aout": 8, "août": 8, "septembre": 9,
+    "octobre": 10, "novembre": 11, "decembre": 12, "décembre": 12,
+}
+
+
+def _normalize_month(mois_simule):
+    """Accepte un numero (1-12) ou un nom de mois francais ; renvoie 1-12."""
+    if isinstance(mois_simule, (int, np.integer)):
+        m = int(mois_simule)
+    else:
+        key = str(mois_simule).strip().lower()
+        if key in _MONTH_NAMES_FR:
+            m = _MONTH_NAMES_FR[key]
+        else:
+            try:
+                m = int(key)
+            except ValueError:
+                raise ValueError(
+                    f"mois_simule ({mois_simule!r}) non reconnu (attendu un entier "
+                    "1-12 ou un nom de mois francais)."
+                )
+    if not (1 <= m <= 12):
+        raise ValueError(f"mois_simule ({mois_simule!r}) doit correspondre a un mois entre 1 et 12.")
+    return m
 
 
 # ============================================================
@@ -253,6 +302,13 @@ def _validate_inputs(config, households, load_profiles,
             f"config['n_timesteps'] ({config['n_timesteps']}) exceeds the number of "
             f"timesteps available in `load_profiles` ({len(load_profiles)})."
         )
+    if config['methode_affectation'] not in ('actuelle', 'banque_mensuelle'):
+        raise ValueError(
+            f"config['methode_affectation'] ({config['methode_affectation']!r}) must be "
+            "'actuelle' or 'banque_mensuelle'."
+        )
+    if config['load_scale'] <= 0:
+        raise ValueError(f"config['load_scale'] ({config['load_scale']}) must be positive.")
 
     # --- v1 scope: pv_profiles / schedules_BSS not yet supported ---
     if pv_profiles is not None and len(pv_profiles) > 0:
@@ -453,6 +509,16 @@ def _build_network(config):
 
 # ============================================================
 #  3. LOAD ASSIGNMENT
+#  Une seule fonction d'assignation (_assign_loads), commune aux deux modes.
+#  methode_affectation ne choisit qu'entre deux "remplisseurs" de
+#  load_profiles (le contrat d'interface que _assign_loads consomme) :
+#  le CSV moyenne+shift+scale ("actuelle", fourni tel quel par l'appelant) ou
+#  _build_load_profiles_banque_mensuelle (vraies semaines du mois choisi).
+#  cf. integrate-bank-B, refonte architecture -- la version precedente
+#  (_assign_loads_bank_mensuelle, une 2e fonction d'assignation qui lisait le
+#  parquet directement et court-circuitait load_profiles) est supprimee :
+#  elle rendait le x3 de main.py inoperant puisque load_profiles n'etait
+#  jamais consulte.
 # ============================================================
 def _assign_loads(net, buses, mv_nodes, households, load_profiles, config):
     """Assign a (perturbed) load profile to each LV charge bus, plus the
@@ -461,6 +527,10 @@ def _assign_loads(net, buses, mv_nodes, households, load_profiles, config):
     Uses the household->street mapping (light street-based association;
     global draw for orphan buses). Applies the frozen stochastic
     perturbation (SHIFT_MAX_STEPS, SCALE_SIGMA) and reactive power (cos_phi).
+
+    Inchangee par la refonte integrate-bank-B : `load_profiles` est un
+    contrat d'interface, peu importe qui l'a rempli (banque plate CSV ou
+    banque mensuelle de vraies semaines) et comment.
 
     Returns
     -------
@@ -471,7 +541,7 @@ def _assign_loads(net, buses, mv_nodes, households, load_profiles, config):
     warnings : list[str]           # e.g. households not matched to a street
     """
     warnings = []
-    rng = np.random.default_rng(RANDOM_SEED)
+    rng = np.random.default_rng(config['seed'])
 
     # street -> [profile_id, ...] ; global fallback pool for unmatched buses
     profiles_by_street = households.groupby('source_street')['profile_id'].apply(list).to_dict()
@@ -525,6 +595,99 @@ def _assign_loads(net, buses, mv_nodes, households, load_profiles, config):
     df_profiles_q = df_profiles_p * tan_phi
 
     return df_profiles_p, df_profiles_q, bus_to_profile, warnings
+
+
+def _load_consumption_bank(bank_path):
+    if not os.path.exists(bank_path):
+        raise FileNotFoundError(
+            f"Banque de semaines reelles introuvable ({bank_path}). Executer "
+            "`python sourcecode/consumption_bank.py` pour la materialiser avant "
+            "d'utiliser config['methode_affectation'] = 'banque_mensuelle'."
+        )
+    return pd.read_parquet(bank_path)
+
+
+def _build_load_profiles_banque_mensuelle(households, config):
+    """Remplit un `load_profiles` dans EXACTEMENT le meme format que celui
+    produit par profil_conso.ipynb pour la methode "actuelle" (index
+    'Mon 00:00'..'Sun 23:45', colonnes profile_{id}, valeurs en MW) mais dont
+    le CONTENU vient de vraies semaines EAN du mois `config['mois_simule']`
+    (cf. sourcecode/consumption_bank.py) au lieu de la moyenne+shift+scale.
+
+    Pour chaque profile_id de `households`, tire (avec remise, seed=
+    config['seed']) une vraie semaine dans la sous-banque de la MEME rue
+    (colonne 'street' de la banque, alignee sur households['source_street'] --
+    meme champ source addressStreet, meme correction de nom, cf.
+    consumption_bank.py). Repli global (toutes rues confondues) si la rue n'a
+    aucune semaine ce mois-la. Micro-jitter anti-doublon (+/-1-2 pas, 15-30
+    min) sur les occurrences repetees d'une meme ligne de banque tiree
+    plusieurs fois. Aucun shift/scale sinon.
+
+    `_assign_loads` ne voit ensuite qu'un `load_profiles` different rempli :
+    l'association par rue (households -> profile_id -> load_profiles) qu'il
+    fait en aval fonctionne a l'identique, sans aucune modification de son
+    code.
+
+    Returns
+    -------
+    load_profiles : pd.DataFrame   # meme forme que load_profiles.csv
+    warnings : list[str]
+    """
+    warnings = []
+    month = _normalize_month(config['mois_simule'])
+    bank = _load_consumption_bank(config['bank_path'])
+    if 'street' not in bank.columns:
+        raise ValueError(
+            f"{config['bank_path']} ne contient pas de colonne 'street' -- "
+            "regenerer la banque avec `python sourcecode/consumption_bank.py` "
+            "(version a jour de consumption_bank.py, qui l'ajoute)."
+        )
+
+    pool_month = bank[bank['month'] == month].reset_index(drop=True)
+    if len(pool_month) == 0:
+        raise ValueError(f"Aucune semaine reelle disponible pour le mois {month} dans {config['bank_path']}.")
+
+    value_cols = [c for c in bank.columns if c.startswith('t') and c[1:].isdigit()]
+    # positions (dans pool_month, indexation partagee) des semaines de chaque rue
+    pool_positions_by_street = {
+        street: idx.to_numpy() for street, idx in pool_month.groupby('street').groups.items()
+    }
+    all_positions = pool_month.index.to_numpy()
+
+    rng = np.random.default_rng(config['seed'])
+
+    street_by_profile = households.drop_duplicates('profile_id').set_index('profile_id')['source_street']
+    profile_ids = sorted(households['profile_id'].unique())
+
+    data = {}
+    draw_counts = {}
+    streets_missing_this_month = set()
+    for pid in profile_ids:
+        street = street_by_profile.loc[pid]
+        candidates = pool_positions_by_street.get(street)
+        if candidates is None or len(candidates) == 0:
+            streets_missing_this_month.add(street)
+            candidates = all_positions
+
+        j = int(candidates[rng.integers(len(candidates))])
+        values = pool_month.loc[j, value_cols].to_numpy(dtype=float)  # deja en MW
+
+        draw_counts[j] = draw_counts.get(j, 0) + 1
+        if draw_counts[j] > 1:
+            step = rng.choice(BANK_JITTER_STEPS)
+            values = np.roll(values, step)
+
+        data[f"profile_{pid}"] = values
+
+    if streets_missing_this_month:
+        warnings.append(
+            f"Aucune semaine reelle pour la/les rue(s) {sorted(streets_missing_this_month)} "
+            f"au mois {month} -- repli sur le pool global pour les profils concernes."
+        )
+
+    load_profiles = pd.DataFrame(data, index=_WEEK_TIME_INDEX)
+    load_profiles.index.name = "week_step"
+    return load_profiles, warnings
 
 
 # ============================================================
@@ -591,6 +754,22 @@ def _collect_violations(df, metric, threshold, mode):
             'detail': detail,
         })
     return violations
+
+
+def _aggregate_profile_summary(df_profiles_p):
+    """Metriques agregees (integrate-bank-B) : somme des puissances actives
+    de toutes les charges a chaque pas, ramenee en kW pour la lisibilite.
+    Additif au summary existant -- ne remplace aucune metrique deja
+    presente."""
+    agg_mw = df_profiles_p.sum(axis=1)
+    peak_mw = float(agg_mw.max())
+    mean_mw = float(agg_mw.mean())
+    summary = {
+        'peak_agg_kw': peak_mw * 1000.0,
+        'mean_agg_kw': mean_mw * 1000.0,
+        'load_factor_agg': (mean_mw / peak_mw) if peak_mw > 0 else None,
+    }
+    return summary, agg_mw
 
 
 def _evaluate(vm, line_load, trafo_load, config):
@@ -692,15 +871,47 @@ def run_digital_twin(config, households, load_profiles,
 
     net, buses, mv_nodes, validation = _build_network(cfg)
 
+    # methode_affectation ne choisit qu'entre deux "remplisseurs" de
+    # load_profiles -- l'assignation elle-meme (_assign_loads) est unique,
+    # commune aux deux modes, et ne voit ensuite qu'un load_profiles
+    # differemment rempli (contrat d'interface inchange).
+    if cfg['methode_affectation'] == 'banque_mensuelle':
+        load_profiles_for_assignment, w_bank = _build_load_profiles_banque_mensuelle(households, cfg)
+        warnings += w_bank
+    else:
+        load_profiles_for_assignment = load_profiles
+
+    # Canal UNIQUE de mise a l'echelle (stress test), applique apres la
+    # construction de load_profiles quel que soit le remplisseur, et avant
+    # l'assignation -- remplace l'ancien mecanisme de main.py qui multipliait
+    # `load_profiles` en amont (canal qui ne touchait que le mode "actuelle"
+    # et laissait "banque_mensuelle" insensible a tout stress). cf.
+    # integrate-bank-B : x3 de main.py devient config['load_scale']=3.
+    load_profiles_for_assignment = load_profiles_for_assignment * cfg['load_scale']
+
     df_p, df_q, bus_to_profile, w_assign = _assign_loads(
-        net, buses, mv_nodes, households, load_profiles, cfg)
+        net, buses, mv_nodes, households, load_profiles_for_assignment, cfg)
     warnings += w_assign
 
     vm, line_load, trafo_load = _run_powerflow(net, df_p, df_q, cfg)
 
     summary, violations = _evaluate(vm, line_load, trafo_load, cfg)
 
+    agg_summary, agg_mw = _aggregate_profile_summary(df_p)
+    summary.update(agg_summary)
+
     out = _format_output(summary, violations, warnings)
+
+    # (!) integrate-bank-B : export optionnel du profil agrege complet
+    # (672 pas), pour comparaison actuelle/banque_mensuelle -- desactive par
+    # defaut pour ne pas alourdir la sortie standard des consommateurs MAS4TE.
+    if cfg.get('export_aggregate_profile'):
+        profile_rows = pd.DataFrame({
+            'category': 'profile_agg', 'element': None, 'metric': 'p_agg_mw',
+            'value': agg_mw.values, 'timestep': range(len(agg_mw)), 'detail': None,
+        })
+        out = pd.concat([out, profile_rows], ignore_index=True)
+
     return out
 
 
@@ -708,12 +919,28 @@ def _config_to_dict(config):
     """Accept config as DataFrame or dict; return a plain dict with defaults."""
     defaults = {
         'n_timesteps': STEPS_PER_WEEK,
-        'v_min': 0.90,
-        'v_max': 1.10,
-        'loading_max': 100.0,
+        'v_min': 0.95,
+        'v_max': 1.05,
+        'loading_max': 90.0,
         'cos_phi': 0.95,
         'trafo_sn_mva': 0.22,
         'data_path': 'data/',
+        # --- integrate-bank-B additions ---
+        'seed': RANDOM_SEED,                  # exposed for reproducible comparisons
+        # Default switched to 'banque_mensuelle' after validation (cf.
+        # outputs_integrate_B/SUMMARY.md) : real-week peaks beat the flat
+        # 350-profile bank without shift/scale artifacts. 'actuelle' stays
+        # fully implemented and selectable for a future re-comparison.
+        'methode_affectation': 'banque_mensuelle',  # 'actuelle' | 'banque_mensuelle'
+        'mois_simule': 1,                     # janvier ; must be a valid month for
+                                               # 'banque_mensuelle' since it's now default
+        'bank_path': 'data/' + CONSUMPTION_BANK_FILE,  # must exist for the new default to run
+                                                        # unconfigured -- cf. sourcecode/consumption_bank.py
+        'export_aggregate_profile': False,    # opt-in 672-row profile_agg export
+        # Canal unique de stress test (remplace l'ancienne multiplication de
+        # load_profiles en amont dans main.py -- cf. run_digital_twin, applique
+        # apres construction de load_profiles quel que soit methode_affectation).
+        'load_scale': 1.0,
     }
     if config is None:
         return defaults
