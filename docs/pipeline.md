@@ -45,27 +45,48 @@
 
 ## 3. Load assignment
 
-## 3. Load assignment
+Load buses are assigned consumption profiles in two decoupled stages: a
+`load_profiles` structure is first filled from a bank of real weeks, then a
+common assignment step maps those profiles onto the load buses.
 
-- Each load bus is given a `load` element, fed by a weekly-type consumption
-  profile drawn from a **profile bank** built from the smart-meter data
-  (see `profil_conso`). Each profile is a 15-minute, one-week average built
-  by aggregating the meter readings per weekday and time of day.
-- Profiles are assigned with a **light street-based association**: a bus on a
-  street that has meters receives a profile drawn at random among the profiles
-  of that same street; a bus on a street without meters (orphan) receives a
-  profile drawn at random from the whole bank, and is flagged as a warning.
-- Each assigned profile is **stochastically perturbed** to reproduce load
-  diversity (foisonnement): a random circular time shift desynchronises the
-  peaks between buses, and a random lognormal scaling factor reflects the
-  spread of household sizes. This avoids an unrealistic simultaneous peak
-  across all buses.
-- Both **active and reactive power** are modelled: reactive power is derived
-  from the active profile using a fixed residential power factor
+### Filling `load_profiles` — monthly real-week bank
+
+- Profiles are **real recorded weeks** drawn from a bank built from the
+  smart-meter data (`data/consumption_bank_real_weeks.parquet`: 1346 complete
+  weeks across 33 EAN, tagged by EAN, street, month and season). Each profile
+  is a genuine recorded week, not an average.
+- The simulated month is set by `config['mois_simule']`. For each street,
+  `load_profiles` is filled with real weeks of that month drawn from the EAN(s)
+  of that same street, preserving both **seasonal consistency** (matching the
+  PVGIS irradiance window, `data/pvgis_irradiance_quarter_hourly.parquet`) and
+  **street locality**. The draw is independent per bus and reproducible via the
+  exposed `seed`.
+- No shift/scale perturbation is applied: load diversity comes from the natural
+  variety of the real weeks rather than from synthetic desynchronisation.
+
+### Assigning profiles to buses
+
+- Once `load_profiles` is filled, a **light street-based association** maps a
+  profile to each load bus: a bus on a street that has meters receives a
+  profile drawn at random among the profiles of that same street; a bus on a
+  street without meters (orphan) receives a profile drawn at random from the
+  whole set, and is flagged as a warning.
+- Each load is modelled in **active and reactive power**: reactive power is
+  derived from the active profile using a fixed residential power factor
   (cos φ = 0.95).
-- Profiles are expressed at a fixed 15-minute time step and converted to
-  MW/MVAr to match pandapower's units. Near-zero loads are clipped to a small
-  positive value to avoid power-flow convergence issues.
+- Profiles are expressed at a fixed **15-minute** time step (672 steps per
+  week) and converted to MW/MVAr to match pandapower's units. Near-zero loads
+  are clipped to a small positive value to avoid power-flow convergence issues.
+- Because the stress multiplier in `main.py` scales `load_profiles`, it applies
+  directly to the assigned loads.
+
+### Known limitation
+
+- The aggregate load factor stays around 0.64, above the real ~0.25, because
+  profiles are drawn independently per bus, which dilutes the natural
+  coincidence of household peaks. Recovering the true value would require a
+  "simultaneous blocks" scheme (grouping real EAN from the same calendar weeks)
+  — relevant later, once PV/EV make the off-peak dynamics matter.
 
 ## 4. Time-series power flow
 

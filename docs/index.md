@@ -5,11 +5,26 @@ network, developed as part of the **MAS4TE** project.
 
 ```{toctree}
 :maxdepth: 2
-:caption: Contents
+:caption: Guide
 
 overview
 pipeline
 interfacing
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Reference
+
+load_assignment
+pv_modelling
+data_files
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Project
+
 todo
 info
 ```
