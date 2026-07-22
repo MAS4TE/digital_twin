@@ -2,7 +2,7 @@
 /outputs*
 .DS_Store
 /docs/_build
-
-# Python bytecode cache (jamais versionne, regenere automatiquement)
 __pycache__/
 *.pyc
+scripts/viz/*.pdf
+scripts/viz/*.png
