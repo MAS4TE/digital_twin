@@ -3,7 +3,7 @@ pandas==2.3.3
 pandapower==3.4.0
 plotly==6.6.0
 matplotlib==3.10.8
-scikit-learn  
+scikit-learn==1.9.0
 
 # Documentation (Sphinx, built from docs/)
 sphinx
