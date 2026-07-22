@@ -3,15 +3,16 @@ Materialisation de la banque de vraies semaines EAN (approche B validee dans
 explore_seasonal_pv.py, branche explore-seasonal-pv) en un fichier parquet
 reutilisable, plus la fenetre d'irradiance PVGIS de reference associee.
 
-Ce module ne fait PAS partie du pipeline MAS4TE (digital_twin.run_digital_twin
-ne l'importe qu'au moment ou methode_affectation="banque_mensuelle" est
-selectionne, via le fichier parquet deja materialise -- pas cette logique de
-construction). Executer ce script une fois pour produire :
+La construction de la banque (build_consumption_bank) ne fait PAS partie du
+pipeline d'execution : run_digital_twin ne lit jamais ce parquet directement.
+C'est le generateur EN AMONT generate_load_profiles (ci-dessous) qui l'exploite
+pour ecrire data/load_profiles.csv, ensuite relu tel quel par run_digital_twin
+(separation generation / execution). Executer ce script une fois pour produire :
 
     data/consumption_bank_real_weeks.parquet
     data/pvgis_irradiance_quarter_hourly.parquet
 
-avant d'utiliser methode_affectation="banque_mensuelle".
+avant d'appeler generate_load_profiles.
 
 Reprend la logique deja validee dans explore_seasonal_pv.py (memes filtres,
 memes tags mois/saison), simplement persistee plutot que recalculee a chaque
@@ -26,6 +27,7 @@ DATA_PATH = "data/"
 RAW_EAN_FILE = "part-00000-3895d355-7ed8-4cff-a072-bdc8805c8651-c000.csv"
 BANK_OUT_PATH = "data/consumption_bank_real_weeks.parquet"
 IRRADIANCE_OUT_PATH = "data/pvgis_irradiance_quarter_hourly.parquet"
+LOAD_PROFILES_OUT_PATH = "data/load_profiles.csv"
 
 N_PER_WEEK = 7 * 96
 NEG_TOLERANCE_KW = -0.01
@@ -140,6 +142,70 @@ def build_irradiance_reference(out_path=IRRADIANCE_OUT_PATH, year=PVGIS_REFERENC
     out.to_parquet(out_path, index=False)
     print(f"Irradiance de reference materialisee : {out_path} ({len(out)} pas quart-horaires, annee {year})")
     return out
+
+
+def generate_load_profiles(mois_simule, households=None, config=None,
+                           out_path=LOAD_PROFILES_OUT_PATH, data_path=DATA_PATH):
+    """Generateur EN AMONT (separation generation / execution) : produit
+    data/load_profiles.csv a partir de la banque de vraies semaines EAN du
+    mois `mois_simule`, au format EXACT attendu par run_digital_twin en
+    lecture (index 'Mon 00:00'..'Sun 23:45', colonnes profile_{id}, valeurs
+    en MW).
+
+    run_digital_twin ne genere plus rien en interne : il RECOIT ce CSV et
+    l'utilise tel quel. Cette fonction encapsule la logique
+    _build_load_profiles_banque_mensuelle (restee dans digital_twin.py, aussi
+    reutilisee par pv_injection.py) et la materialise sur disque.
+
+    Parameters
+    ----------
+    mois_simule : str | int   -- mois cible de la banque (nom francais ou 1-12)
+    households : pd.DataFrame, optionnel -- households.csv (lu depuis data_path si None)
+    config : dict, optionnel  -- surcharge (seed, bank_path, ...) ; mois_simule
+                                  est impose par l'argument du meme nom
+    out_path : str            -- chemin du CSV genere (data/load_profiles.csv)
+
+    Returns
+    -------
+    (load_profiles : pd.DataFrame, warnings : list[str])
+    """
+    # Import local pour eviter tout cycle a l'import du module (digital_twin
+    # n'importe pas consumption_bank, mais on garde l'import au plus pres de
+    # l'usage). _build_load_profiles_banque_mensuelle reste la source unique de
+    # la logique de tirage (une seule implementation, partagee).
+    from sourcecode.digital_twin import (
+        _build_load_profiles_banque_mensuelle, _config_to_dict,
+    )
+
+    if households is None:
+        households = pd.read_csv(data_path + "households.csv")
+
+    cfg = _config_to_dict(config)
+    cfg['mois_simule'] = mois_simule
+
+    load_profiles, warnings = _build_load_profiles_banque_mensuelle(households, cfg)
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    load_profiles.to_csv(out_path)
+
+    # Aller-retour : le CSV ecrit doit etre relu IDENTIQUE par main.py, qui lit
+    # via pd.read_csv(out_path, index_col=0). On rejoue exactement cette lecture
+    # et on compare (index, colonnes, valeurs) -- garde-fou contre une derive de
+    # format (separateur, encodage, precision) entre ecriture et relecture.
+    reread = pd.read_csv(out_path, index_col=0)
+    same = (
+        list(reread.index) == list(load_profiles.index)
+        and list(reread.columns) == list(load_profiles.columns)
+        and np.allclose(reread.to_numpy(dtype=float),
+                        load_profiles.to_numpy(dtype=float))
+    )
+    if not same:
+        raise RuntimeError(
+            f"Aller-retour {out_path} echoue : le CSV relu differe du DataFrame "
+            "genere (index/colonnes/valeurs)."
+        )
+
+    return load_profiles, warnings
 
 
 if __name__ == "__main__":

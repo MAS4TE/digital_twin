@@ -15,8 +15,11 @@ Pipeline (see pipeline.md):
     5. Results evaluation (verdicts)
     6. Output formatting
 
-v1 scope: LOADS ONLY. `pv_profiles` and `schedules_BSS` are accepted in the
-signature (MAS4TE contract) but not yet implemented -> ignored with a warning.
+Scope: LOADS + PV. `pv_profiles` est desormais une capacite native (injection
+sgen, cf. _inject_pv_sgens / _run_powerflow) : si fourni, le power flow tourne
+charges + PV ensemble ; si None, comportement charges seules inchange.
+`schedules_BSS` reste accepte dans la signature (contrat MAS4TE) mais pas encore
+implemente -> ignore avec un warning.
 """
 
 import math
@@ -166,12 +169,19 @@ CABINE_STREET_SEGMENTS = [
 ]
 
 # ============================================================
-#  Load assignment method B ("banque_mensuelle") — additions (integrate-bank-B)
+#  Generation des profils "banque mensuelle" — additions (integrate-bank-B)
 #  cf. explore_seasonal_pv.py (branche explore-seasonal-pv) : banque de
 #  vraies semaines EAN (672 pas), segmentee par mois, materialisee par
-#  sourcecode/consumption_bank.py. Coexiste avec la methode "actuelle"
-#  (_assign_loads) — selectionnable via config['methode_affectation'],
-#  defaut "actuelle" (comportement inchange tant que non selectionne).
+#  sourcecode/consumption_bank.py.
+#
+#  ARCHITECTURE (refonte separation generation/execution) : la logique de
+#  generation ci-dessous (_build_load_profiles_banque_mensuelle) N'EST PLUS
+#  appelee par run_digital_twin. Elle est desormais consommee EN AMONT :
+#    - sourcecode/consumption_bank.generate_load_profiles -> ecrit
+#      data/load_profiles.csv, que run_digital_twin relit ensuite tel quel ;
+#    - sourcecode/pv_injection.py -> construit ses profils de charge.
+#  Elle reste ici (importee par ces deux modules) plutot que deplacee, pour
+#  ne pas casser leurs imports.
 # ============================================================
 CONSUMPTION_BANK_FILE = "consumption_bank_real_weeks.parquet"
 BANK_JITTER_STEPS = [-2, -1, 1, 2]  # +/- 15-30 min, uniquement sur doublons
@@ -302,19 +312,33 @@ def _validate_inputs(config, households, load_profiles,
             f"config['n_timesteps'] ({config['n_timesteps']}) exceeds the number of "
             f"timesteps available in `load_profiles` ({len(load_profiles)})."
         )
-    if config['methode_affectation'] not in ('actuelle', 'banque_mensuelle'):
-        raise ValueError(
-            f"config['methode_affectation'] ({config['methode_affectation']!r}) must be "
-            "'actuelle' or 'banque_mensuelle'."
-        )
     if config['load_scale'] <= 0:
         raise ValueError(f"config['load_scale'] ({config['load_scale']}) must be positive.")
 
-    # --- v1 scope: pv_profiles / schedules_BSS not yet supported ---
+    # --- pv_profiles (optionnel) : capacite native desormais supportee.
+    # Format attendu : colonnes 'pv_{bus_id}' (bus_id entier), index temporel
+    # aligne sur load_profiles ('Mon 00:00'..'Sun 23:45'), valeurs en MW (meme
+    # unite que load_profiles -- cf. run_digital_twin). On valide ici la forme
+    # des colonnes et la couverture temporelle ; l'existence des bus et
+    # l'alignement d'index sont verifies au moment de l'injection
+    # (_inject_pv_sgens / _verify_temporal_alignment).
     if pv_profiles is not None and len(pv_profiles) > 0:
-        warnings.append("`pv_profiles` was provided but is not yet supported in this v1 (loads only) — ignored.")
+        bad_cols = [c for c in pv_profiles.columns
+                    if not (str(c).startswith('pv_') and str(c)[3:].isdigit())]
+        if bad_cols:
+            raise ValueError(
+                "`pv_profiles` a des colonnes hors format 'pv_{bus_id}' (bus_id entier) : "
+                f"{bad_cols[:10]}{' ...' if len(bad_cols) > 10 else ''}"
+            )
+        if config['n_timesteps'] > len(pv_profiles):
+            raise ValueError(
+                f"config['n_timesteps'] ({config['n_timesteps']}) depasse le nombre de pas "
+                f"disponibles dans `pv_profiles` ({len(pv_profiles)})."
+            )
+
+    # --- schedules_BSS : pas encore supporte ---
     if schedules_BSS is not None and len(schedules_BSS) > 0:
-        warnings.append("`schedules_BSS` was provided but is not yet supported in this v1 (loads only) — ignored.")
+        warnings.append("`schedules_BSS` was provided but is not yet supported (loads + PV only) — ignored.")
 
     return warnings
 
@@ -509,16 +533,20 @@ def _build_network(config):
 
 # ============================================================
 #  3. LOAD ASSIGNMENT
-#  Une seule fonction d'assignation (_assign_loads), commune aux deux modes.
-#  methode_affectation ne choisit qu'entre deux "remplisseurs" de
-#  load_profiles (le contrat d'interface que _assign_loads consomme) :
-#  le CSV moyenne+shift+scale ("actuelle", fourni tel quel par l'appelant) ou
-#  _build_load_profiles_banque_mensuelle (vraies semaines du mois choisi).
-#  cf. integrate-bank-B, refonte architecture -- la version precedente
-#  (_assign_loads_bank_mensuelle, une 2e fonction d'assignation qui lisait le
-#  parquet directement et court-circuitait load_profiles) est supprimee :
-#  elle rendait le x3 de main.py inoperant puisque load_profiles n'etait
-#  jamais consulte.
+#  Une seule fonction d'assignation (_assign_loads) : elle consomme le
+#  `load_profiles` RECU par run_digital_twin (contrat d'interface), peu
+#  importe qui l'a produit et comment. La generation de ce load_profiles se
+#  fait en AMONT (hors du twin), cf. sourcecode/consumption_bank.py.
+#
+#  Ou vit la methode "actuelle" ? C'etait le CSV moyenne+shift+scale de
+#  profil_conso.ipynb (data/load_profiles.csv historique), autrefois selectionne
+#  via config['methode_affectation']='actuelle'. Ce commutateur est retire du
+#  twin (option A) : "actuelle" n'est plus cablee comme methode de generation.
+#  Son artefact (le CSV plat) et le notebook qui le produit ne sont pas
+#  supprimes -- ils restent disponibles pour une re-comparaison, mais hors du
+#  chemin principal (main.py genere desormais load_profiles.csv via la banque
+#  mensuelle). cf. integrate-bank-B : _assign_loads_bank_mensuelle (2e fonction
+#  d'assignation qui court-circuitait load_profiles) reste supprimee.
 # ============================================================
 def _assign_loads(net, buses, mv_nodes, households, load_profiles, config):
     """Assign a (perturbed) load profile to each LV charge bus, plus the
@@ -597,12 +625,70 @@ def _assign_loads(net, buses, mv_nodes, households, load_profiles, config):
     return df_profiles_p, df_profiles_q, bus_to_profile, warnings
 
 
+# ============================================================
+#  3bis. INJECTION PV (capacite native ; rapatriee de pv_injection.py)
+#  Source UNIQUE de la logique d'injection : pv_injection.py et
+#  scripts/pv_impact_analysis.py importent desormais ces fonctions d'ici
+#  (inversion de dependance -- le fichier central est autonome, il ne depend
+#  plus d'un fichier outil).
+# ============================================================
+def _inject_pv_sgens(net, pv_profiles):
+    """Cree un sgen par colonne 'pv_{bus_id}' de `pv_profiles`, sur `net`.
+
+    Convention pandapower : sgen p_mw POSITIF = injection (PAS un load
+    negatif). p_mw=q_mvar=0 a la creation (rempli au pas de temps par
+    ConstControl dans _run_powerflow, meme reflexe que _assign_loads pour les
+    loads). q_mvar=0 tout le run (v1 : onduleurs en actif pur).
+
+    net.sgen est vide au prealable (jamais accumuler entre appels repetes,
+    meme reflexe que net.load dans _assign_loads).
+
+    Returns
+    -------
+    sgen_bus : dict {index dans net.sgen -> bus_id}
+    """
+    net.sgen = net.sgen.iloc[0:0]
+    valid_bus = set(net.bus.index)
+    sgen_bus = {}
+    for col in pv_profiles.columns:
+        # 'pv_123' -> 123 (format garanti par _validate_inputs cote twin ;
+        # revalide ici l'existence du bus car pv_injection appelle aussi
+        # directement, sans passer par _validate_inputs).
+        bus_id = int(str(col).split('_', 1)[1])
+        if bus_id not in valid_bus:
+            raise ValueError(
+                f"pv_profiles : colonne {col!r} vise un bus_id {bus_id} absent du reseau."
+            )
+        idx = pp.create_sgen(net, bus=bus_id, p_mw=0.0, q_mvar=0.0, name=str(col))
+        sgen_bus[idx] = bus_id
+    return sgen_bus
+
+
+def _verify_temporal_alignment(df_load_p, df_pv_p):
+    """Garde-fou temporel (bug d'index deja rencontre) : charges et PV doivent
+    partager le MEME index (meme longueur, memes labels, meme ordre) --
+    l'alignement au pas t n'est mecanique que si c'est le cas. Leve une erreur
+    claire plutot que de laisser un decalage silencieux fausser le bilan net
+    production/consommation."""
+    if len(df_load_p) != len(df_pv_p):
+        raise ValueError(
+            f"Longueurs differentes : load={len(df_load_p)} pas, PV={len(df_pv_p)} pas."
+        )
+    if list(df_load_p.index) != list(df_pv_p.index):
+        raise ValueError(
+            "Index different entre profils de charge et de production PV -- "
+            "l'alignement pas-a-pas n'est plus garanti mecaniquement."
+        )
+    return True
+
+
 def _load_consumption_bank(bank_path):
     if not os.path.exists(bank_path):
         raise FileNotFoundError(
             f"Banque de semaines reelles introuvable ({bank_path}). Executer "
             "`python sourcecode/consumption_bank.py` pour la materialiser avant "
-            "d'utiliser config['methode_affectation'] = 'banque_mensuelle'."
+            "de generer load_profiles via la banque mensuelle "
+            "(consumption_bank.generate_load_profiles)."
         )
     return pd.read_parquet(bank_path)
 
@@ -693,14 +779,22 @@ def _build_load_profiles_banque_mensuelle(households, config):
 # ============================================================
 #  4. TIME-SERIES POWER FLOW
 # ============================================================
-def _run_powerflow(net, df_profiles_p, df_profiles_q, config):
+def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None):
     """Attach controllers and run the time-series power flow.
+
+    Charges TOUJOURS. Si `df_pv_p` est fourni (colonnes 'pv_{bus_id}', MW ;
+    sgen deja poses par _inject_pv_sgens), ajoute la couche PV et releve en
+    plus les signaux de flux (sens/inversion) utiles a l'analyse d'impact PV
+    (surtension, flux inverses). Si `df_pv_p` est None, power flow charges
+    seules -- comportement strictement inchange (non-regression).
+
+    Rapatrie de pv_injection.run_powerflow_with_pv : une seule copie de la
+    logique charges+PV existe desormais (ici).
 
     Returns
     -------
-    vm : pd.DataFrame        # bus voltage magnitudes [pu], n_timesteps x n_bus
-    line_load : pd.DataFrame # line loading [%]
-    trafo_load : pd.DataFrame# transformer loading [%]
+    dict : 'vm', 'line_load', 'trafo_load' (toujours) et, si PV,
+    'line_p_from', 'trafo_p_hv', 'ext_grid_p', 'sgen_p_out'.
     """
     net.controller = net.controller.iloc[0:0]  # avoid stacking controllers on repeated calls
 
@@ -714,6 +808,13 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config):
         ConstControl(net, element='load', variable='q_mvar', element_index=[i],
                      data_source=data_source_q, profile_name=load_column)
 
+    with_pv = df_pv_p is not None
+    if with_pv:
+        data_source_pv = DFData(df_pv_p)
+        for i, sgen in net.sgen.iterrows():
+            ConstControl(net, element='sgen', variable='p_mw', element_index=[i],
+                         data_source=data_source_pv, profile_name=sgen["name"])
+
     n_timesteps = config['n_timesteps']
     # output_path=None -> results collected in memory only (ow.output), no CSV
     # round-trip through disk as in the notebook: cleaner for a callable module.
@@ -721,14 +822,25 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config):
     ow.log_variable('res_bus', 'vm_pu')
     ow.log_variable('res_line', 'loading_percent')
     ow.log_variable('res_trafo', 'loading_percent')
+    if with_pv:
+        ow.log_variable('res_line', 'p_from_mw')     # signe : sens du flux (flux inverses)
+        ow.log_variable('res_trafo', 'p_hv_mw')      # signe : <0 = flux HT->BT inverse sur ce trafo
+        ow.log_variable('res_ext_grid', 'p_mw')      # signe : <0 = le reseau exporte vers l'amont
+        ow.log_variable('res_sgen', 'p_mw')
 
     run_timeseries(net, time_steps=range(n_timesteps), verbose=False)
 
-    vm = ow.output['res_bus.vm_pu']
-    line_load = ow.output['res_line.loading_percent']
-    trafo_load = ow.output['res_trafo.loading_percent']
-
-    return vm, line_load, trafo_load
+    out = {
+        'vm': ow.output['res_bus.vm_pu'],
+        'line_load': ow.output['res_line.loading_percent'],
+        'trafo_load': ow.output['res_trafo.loading_percent'],
+    }
+    if with_pv:
+        out['line_p_from'] = ow.output['res_line.p_from_mw']
+        out['trafo_p_hv'] = ow.output['res_trafo.p_hv_mw']
+        out['ext_grid_p'] = ow.output['res_ext_grid.p_mw']
+        out['sgen_p_out'] = ow.output['res_sgen.p_mw']
+    return out
 
 
 # ============================================================
@@ -854,9 +966,15 @@ def run_digital_twin(config, households, load_profiles,
     ----------
     config : pd.DataFrame        # tunable simulation/validation parameters
     households : pd.DataFrame    # households (profile_id, location, substation...)
-    load_profiles : pd.DataFrame # consumption profiles (n_timesteps x n_profiles)
-    pv_profiles : pd.DataFrame, optional     # v1: ignored (warning if provided)
-    schedules_BSS : pd.DataFrame, optional   # v1: ignored (warning if provided)
+    load_profiles : pd.DataFrame # consumption profiles (n_timesteps x n_profiles), MW
+    pv_profiles : pd.DataFrame, optional
+        Production PV. Colonnes 'pv_{bus_id}' (bus_id entier du reseau), index
+        temporel aligne sur load_profiles ('Mon 00:00'..'Sun 23:45'), valeurs
+        en MW (MEME unite que load_profiles -- si la production vient de
+        pv_production.build_pv_production, qui sort des kW, convertir /1000 en
+        amont, cf. main.py). Si fourni : injecte comme sgen, power flow charges
+        + PV. Si None : aucun PV (comportement charges seules inchange).
+    schedules_BSS : pd.DataFrame, optional   # pas encore supporte (warning if provided)
 
     Returns
     -------
@@ -871,29 +989,42 @@ def run_digital_twin(config, households, load_profiles,
 
     net, buses, mv_nodes, validation = _build_network(cfg)
 
-    # methode_affectation ne choisit qu'entre deux "remplisseurs" de
-    # load_profiles -- l'assignation elle-meme (_assign_loads) est unique,
-    # commune aux deux modes, et ne voit ensuite qu'un load_profiles
-    # differemment rempli (contrat d'interface inchange).
-    if cfg['methode_affectation'] == 'banque_mensuelle':
-        load_profiles_for_assignment, w_bank = _build_load_profiles_banque_mensuelle(households, cfg)
-        warnings += w_bank
-    else:
-        load_profiles_for_assignment = load_profiles
+    # Separation generation / execution : run_digital_twin ne GENERE plus de
+    # profils en interne -- il RECOIT `load_profiles` (produit en amont par la
+    # banque mensuelle, cf. sourcecode/consumption_bank.generate_load_profiles)
+    # et l'utilise tel quel. Le choix de la methode de generation n'appartient
+    # donc plus au twin (methode_affectation retire -- option A). L'assignation
+    # (_assign_loads) reste inchangee : load_profiles est un contrat d'interface,
+    # peu importe qui l'a rempli.
+    load_profiles_for_assignment = load_profiles
 
-    # Canal UNIQUE de mise a l'echelle (stress test), applique apres la
-    # construction de load_profiles quel que soit le remplisseur, et avant
-    # l'assignation -- remplace l'ancien mecanisme de main.py qui multipliait
-    # `load_profiles` en amont (canal qui ne touchait que le mode "actuelle"
-    # et laissait "banque_mensuelle" insensible a tout stress). cf.
-    # integrate-bank-B : x3 de main.py devient config['load_scale']=3.
+    # Canal UNIQUE de mise a l'echelle (stress test) : parametre d'EXECUTION
+    # (stress, pas de generation -- sa place est ici), applique sur le
+    # load_profiles RECU, avant l'assignation. cf. integrate-bank-B : le x3 de
+    # main.py est config['load_scale']=3, qui s'applique desormais sur le
+    # load_profiles genere par la banque.
     load_profiles_for_assignment = load_profiles_for_assignment * cfg['load_scale']
 
     df_p, df_q, bus_to_profile, w_assign = _assign_loads(
         net, buses, mv_nodes, households, load_profiles_for_assignment, cfg)
     warnings += w_assign
 
-    vm, line_load, trafo_load = _run_powerflow(net, df_p, df_q, cfg)
+    # --- Injection PV (capacite native, pilotee par l'argument pv_profiles) ---
+    # pv_profiles fourni : pose un sgen par colonne 'pv_{bus_id}' et lance le
+    # power flow charges + PV ensemble. pv_profiles=None : aucun PV, power flow
+    # charges seules -- comportement strictement inchange (non-regression).
+    df_pv_p = None
+    if pv_profiles is not None and len(pv_profiles) > 0:
+        # Alignement positionnel : _assign_loads construit df_p via .values
+        # (index texte 'Mon 00:00'.. perdu -> RangeIndex 0..N-1). On remet
+        # pv_profiles sur ce meme RangeIndex AVANT la verif d'alignement et le
+        # power flow (DFData/ConstControl indexent par position).
+        df_pv_p = pv_profiles.reset_index(drop=True)
+        _verify_temporal_alignment(df_p, df_pv_p)   # garde-fou index (bug deja rencontre)
+        _inject_pv_sgens(net, df_pv_p)
+
+    pf = _run_powerflow(net, df_p, df_q, cfg, df_pv_p=df_pv_p)
+    vm, line_load, trafo_load = pf['vm'], pf['line_load'], pf['trafo_load']
 
     summary, violations = _evaluate(vm, line_load, trafo_load, cfg)
 
@@ -927,19 +1058,19 @@ def _config_to_dict(config):
         'data_path': 'data/',
         # --- integrate-bank-B additions ---
         'seed': RANDOM_SEED,                  # exposed for reproducible comparisons
-        # Default switched to 'banque_mensuelle' after validation (cf.
-        # outputs_integrate_B/SUMMARY.md) : real-week peaks beat the flat
-        # 350-profile bank without shift/scale artifacts. 'actuelle' stays
-        # fully implemented and selectable for a future re-comparison.
-        'methode_affectation': 'banque_mensuelle',  # 'actuelle' | 'banque_mensuelle'
-        'mois_simule': 1,                     # janvier ; must be a valid month for
-                                               # 'banque_mensuelle' since it's now default
-        'bank_path': 'data/' + CONSUMPTION_BANK_FILE,  # must exist for the new default to run
-                                                        # unconfigured -- cf. sourcecode/consumption_bank.py
+        # mois_simule / bank_path : parametres de GENERATION (banque mensuelle).
+        # run_digital_twin ne genere plus (option A -- methode_affectation retire) ;
+        # ils ne sont donc plus lus par le twin lui-meme, mais restent ici comme
+        # defauts pour _build_load_profiles_banque_mensuelle, appele en AMONT par
+        # sourcecode/consumption_bank.generate_load_profiles (generateur du CSV)
+        # et par sourcecode/pv_injection.py (qui construit ses profils via cette
+        # meme logique et _config_to_dict).
+        'mois_simule': 1,                     # janvier ; mois cible de la banque a la generation
+        'bank_path': 'data/' + CONSUMPTION_BANK_FILE,  # banque de vraies semaines -- cf. consumption_bank.py
         'export_aggregate_profile': False,    # opt-in 672-row profile_agg export
-        # Canal unique de stress test (remplace l'ancienne multiplication de
-        # load_profiles en amont dans main.py -- cf. run_digital_twin, applique
-        # apres construction de load_profiles quel que soit methode_affectation).
+        # Canal unique de stress test : parametre d'EXECUTION applique par
+        # run_digital_twin sur le load_profiles RECU (remplace l'ancienne
+        # multiplication de load_profiles en amont dans main.py).
         'load_scale': 1.0,
     }
     if config is None:

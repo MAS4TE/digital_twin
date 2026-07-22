@@ -8,9 +8,10 @@ contrôle de complétude (confirmer l'absence de surtension hivernale).
 
 S'appuie sur l'architecture réseau de base + deepcopy de la brique 3
 (`sourcecode.pv_injection.build_base_network` / `run_pv_scenario`).
-`verify_temporal_alignment()` reste active à l'intérieur de
-`run_pv_scenario()` -- appelée systématiquement avant chaque power flow, pas
-retirée (garde-fou explicitement demandé par le brief brique 4).
+Le garde-fou d'alignement temporel (désormais
+`digital_twin._verify_temporal_alignment`, rapatrié avec l'injection PV) reste
+appelé à l'intérieur de `run_pv_scenario()` avant chaque power flow -- pas
+retiré (garde-fou explicitement demandé par le brief brique 4).
 
 Génère aussi les 2 figures de contrôle dans outputs_pv_impact/ (backend Agg).
 Pas un livrable réutilisable -- script d'analyse, résultats synthétisés dans
