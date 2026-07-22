@@ -9,7 +9,9 @@
   in Bressoux, matched to house numbers.
 - EANs with less than one year of metered consumption are discarded to avoid
   building the network from too short a history.
-- **Load profile** (`data/load_profiles.csv`): Consumption profile bank built based on the EANs and Stochastic variation over time and power (+/-2 hours and 0-20% increase)
+- From the retained meters, a bank of **real weekly consumption profiles** is
+  built (`data/consumption_bank_real_weeks.parquet`), from which
+  `load_profiles` is later generated. See [Load assignment](load_assignment.md).
 
 ## 2. Network reconstruction
 
@@ -45,69 +47,39 @@
 
 ## 3. Load assignment
 
-Load buses are assigned consumption profiles in two decoupled stages: a
-`load_profiles` structure is first filled from a bank of real weeks, then a
-common assignment step maps those profiles onto the load buses.
-
-### Filling `load_profiles` — monthly real-week bank
-
-- Profiles are **real recorded weeks** drawn from a bank built from the
-  smart-meter data (`data/consumption_bank_real_weeks.parquet`: 1346 complete
-  weeks across 33 EAN, tagged by EAN, street, month and season). Each profile
-  is a genuine recorded week, not an average.
-- The simulated month is set by `config['mois_simule']`. For each street,
-  `load_profiles` is filled with real weeks of that month drawn from the EAN(s)
-  of that same street, preserving both **seasonal consistency** (matching the
-  PVGIS irradiance window, `data/pvgis_irradiance_quarter_hourly.parquet`) and
-  **street locality**. The draw is independent per bus and reproducible via the
-  exposed `seed`.
-- No shift/scale perturbation is applied: load diversity comes from the natural
-  variety of the real weeks rather than from synthetic desynchronisation.
-
-### Assigning profiles to buses
-
-- Once `load_profiles` is filled, a **light street-based association** maps a
-  profile to each load bus: a bus on a street that has meters receives a
-  profile drawn at random among the profiles of that same street; a bus on a
-  street without meters (orphan) receives a profile drawn at random from the
-  whole set, and is flagged as a warning.
-- Each load is modelled in **active and reactive power**: reactive power is
-  derived from the active profile using a fixed residential power factor
-  (cos φ = 0.95).
-- Profiles are expressed at a fixed **15-minute** time step (672 steps per
-  week) and converted to MW/MVAr to match pandapower's units. Near-zero loads
-  are clipped to a small positive value to avoid power-flow convergence issues.
-- Because the stress multiplier in `main.py` scales `load_profiles`, it applies
-  directly to the assigned loads.
-
-### Known limitation
-
-- The aggregate load factor stays around 0.64, above the real ~0.25, because
-  profiles are drawn independently per bus, which dilutes the natural
-  coincidence of household peaks. Recovering the true value would require a
-  "simultaneous blocks" scheme (grouping real EAN from the same calendar weeks)
-  — relevant later, once PV/EV make the off-peak dynamics matter.
+Consumption profiles reach the buses in two decoupled stages: a
+`load_profiles.csv` is **generated upstream** from a bank of real weeks, then
+`run_digital_twin` **receives** it and its assignment step maps the profiles
+onto the load buses (light street-based association; orphan buses without
+meters draw from the whole set and are flagged). Reactive power uses a fixed
+residential power factor (cos φ = 0.95); profiles are at a 15-minute step in
+MW/MVAr. No shift/scale perturbation is applied — diversity comes from the real
+weeks themselves. See [Load assignment](load_assignment.md) for the details.
 
 ## 4. Time-series power flow
 
-- Each load is attached to its profile through a pandapower `ConstControl`.
-- An `OutputWriter` logs bus voltage magnitudes, line loadings and load
-  active/reactive power for every time step.
+- Each load is attached to its profile through a pandapower `ConstControl`
+  (fed by a `DFData` data source); when PV is present, one `ConstControl` per
+  `sgen` is added for the PV injection.
+- An `OutputWriter` logs bus voltage magnitudes, line and transformer loadings
+  for every time step; with PV, it additionally logs the signed line, trafo,
+  external-grid and sgen powers (to observe reverse flows).
 - `pandapower.timeseries.run_timeseries` runs an AC power flow (Newton-Raphson)
   over the full simulation horizon.
+- The power-flow helper returns loads-only results when no PV is given, and an
+  extended result (including the flow signals above) when PV is injected.
 
 ## 5. Results and visualisation
 
-- Time-series results (voltages, loadings) are written to CSV under
-  `outputs/`.
-- Results can be inspected at any time step and plotted on a map
-  (`pf_res_plotly`, `simple_plotly`) to visualise voltage levels and line
-  loading across the neighbourhood.
+- Time-series results (voltages, loadings) can be written to CSV under
+  `outputs/`, and the aggregated verdict is returned by `run_digital_twin`.
+- Results can be inspected at any time step and plotted on a map to visualise
+  voltage levels and line loading across the neighbourhood.
 
 ## 6. Packaging as a digital twin function
 
-The steps above are being consolidated into `run_digital_twin`
-(`sourcecode/digital_twin.py`), which takes the same kind of inputs
-(configuration, households, load/PV profiles, battery schedules) as plain
-`pandas` DataFrames and returns a single DataFrame with the resulting
-time-series and warnings — see [Interfacing](interfacing.md).
+The steps above are consolidated into `run_digital_twin`
+(`sourcecode/digital_twin.py`), which takes its inputs (configuration,
+households, load and PV profiles, battery schedules) as plain `pandas`
+DataFrames and returns a single DataFrame with the resulting summary verdict,
+violations and warnings — see [Interfacing](interfacing.md).

@@ -1,22 +1,17 @@
 """
-Materialisation de la banque de vraies semaines EAN (approche B validee dans
-explore_seasonal_pv.py, branche explore-seasonal-pv) en un fichier parquet
-reutilisable, plus la fenetre d'irradiance PVGIS de reference associee.
+Materialize the bank of real EAN weeks into a reusable parquet file, plus the
+associated reference PVGIS irradiance window.
 
-La construction de la banque (build_consumption_bank) ne fait PAS partie du
-pipeline d'execution : run_digital_twin ne lit jamais ce parquet directement.
-C'est le generateur EN AMONT generate_load_profiles (ci-dessous) qui l'exploite
-pour ecrire data/load_profiles.csv, ensuite relu tel quel par run_digital_twin
-(separation generation / execution). Executer ce script une fois pour produire :
+Building the bank (build_consumption_bank) is NOT part of the execution
+pipeline: run_digital_twin never reads this parquet directly. The upstream
+generator generate_load_profiles (below) uses it to write data/load_profiles.csv,
+which run_digital_twin then reads as-is (generation / execution split). Run this
+script once to produce:
 
     data/consumption_bank_real_weeks.parquet
     data/pvgis_irradiance_quarter_hourly.parquet
 
-avant d'appeler generate_load_profiles.
-
-Reprend la logique deja validee dans explore_seasonal_pv.py (memes filtres,
-memes tags mois/saison), simplement persistee plutot que recalculee a chaque
-run.
+before calling generate_load_profiles.
 """
 import os
 
@@ -39,33 +34,32 @@ SEASON_MONTHS = {
 MONTH_TO_SEASON = {m: s for s, months in SEASON_MONTHS.items() for m in months}
 
 LAT, LON = 50.639, 5.605
-PVGIS_REFERENCE_YEAR = 2023  # cf. explore_seasonal_pv.py : SARAH3 couvre 2005-2023
+PVGIS_REFERENCE_YEAR = 2023  # SARAH3 covers 2005-2023
 
 
 def _ean_power_series(df, ean):
-    """Serie tz-aware (index = measuredatetime reel, valeurs = kW).
+    """tz-aware series (index = real measuredatetime, values = kW).
 
-    Rester en Series/DatetimeIndex pandas de bout en bout : passer par
-    .values sur un index tz-aware degrade en datetime64 naif et casse
-    silencieusement tout reindex ulterieur contre un index tz-aware.
+    Stay on a pandas Series/DatetimeIndex end to end: going through .values on a
+    tz-aware index degrades it to naive datetime64 and silently breaks any later
+    reindex against a tz-aware index.
     """
     g = df[df['ean_anon'] == ean].sort_values('measuredatetime').set_index('measuredatetime')
     return (g['measure_cons'].diff() * 4).iloc[1:]
 
 
 def build_consumption_bank(data_path=DATA_PATH, out_path=BANK_OUT_PATH):
-    """Extrait toutes les semaines calendaires reelles completes (672 pas,
-    lun-dim) des EAN retenus, taguees par EAN/mois/saison/RUE, et les
-    persiste en parquet (format large : colonnes meta + t0000..t0671 en MW).
+    """Extract all complete real calendar weeks (672 steps, Mon-Sun) of the kept
+    EANs, tagged by EAN/month/season/STREET, and persist them to parquet (wide
+    format: meta columns + t0000..t0671 in MW).
 
-    La colonne 'street' est necessaire a l'association par rue en aval
-    (digital_twin._build_load_profiles_banque_mensuelle) : elle doit suivre
-    EXACTEMENT la meme convention de nom que households.csv['source_street']
-    pour que le rattachement rue->profil fonctionne. C'est le cas ici : meme
-    champ source (addressStreet), meme correction ponctuelle ("Avenue
-    Joseph-Merlot" -> "Avenue Joseph Merlot"), meme filtre EAN (total_cons
-    >= 365) et donc meme indexation `unique_eans` -- verifie identique a
-    celle de profil_conso.ipynb (meme ordre, memes 33 EAN).
+    The 'street' column is needed for the downstream per-street association
+    (digital_twin._build_load_profiles_banque_mensuelle): it must follow EXACTLY
+    the same naming convention as households.csv['source_street'] for the
+    street->profile mapping to work. That holds here: same source field
+    (addressStreet), same one-off correction ("Avenue Joseph-Merlot" -> "Avenue
+    Joseph Merlot"), same EAN filter (total_cons >= 365) and therefore the same
+    `unique_eans` indexing.
     """
     df = pd.read_csv(
         data_path + RAW_EAN_FILE,
@@ -108,7 +102,7 @@ def build_consumption_bank(data_path=DATA_PATH, out_path=BANK_OUT_PATH):
                 "month": ws.month, "season": MONTH_TO_SEASON[ws.month],
                 "week_start": ws.isoformat(),
             }
-            # kW -> MW, coherent avec load_profiles.csv (deja en MW)
+            # kW -> MW, consistent with load_profiles.csv (already in MW)
             row.update({f"t{k:04d}": v / 1000.0 for k, v in enumerate(wv.values)})
             rows.append(row)
 
@@ -121,9 +115,8 @@ def build_consumption_bank(data_path=DATA_PATH, out_path=BANK_OUT_PATH):
 
 
 def build_irradiance_reference(out_path=IRRADIANCE_OUT_PATH, year=PVGIS_REFERENCE_YEAR):
-    """Irradiance globale PVGIS-SARAH3 (horaire -> quart-horaire par
-    forward-fill, cf. explore_seasonal_pv.py pour la justification), persistee
-    pour ne pas dependre d'un appel reseau a chaque run d'integration.
+    """Global PVGIS-SARAH3 irradiance (hourly -> quarter-hourly by forward-fill),
+    persisted so runs do not depend on a network call each time.
     """
     import pvlib
 
@@ -146,33 +139,31 @@ def build_irradiance_reference(out_path=IRRADIANCE_OUT_PATH, year=PVGIS_REFERENC
 
 def generate_load_profiles(mois_simule, households=None, config=None,
                            out_path=LOAD_PROFILES_OUT_PATH, data_path=DATA_PATH):
-    """Generateur EN AMONT (separation generation / execution) : produit
-    data/load_profiles.csv a partir de la banque de vraies semaines EAN du
-    mois `mois_simule`, au format EXACT attendu par run_digital_twin en
-    lecture (index 'Mon 00:00'..'Sun 23:45', colonnes profile_{id}, valeurs
-    en MW).
+    """Upstream generator (generation / execution split): produces
+    data/load_profiles.csv from the bank of real EAN weeks of month
+    `mois_simule`, in the exact format run_digital_twin reads (index
+    'Mon 00:00'..'Sun 23:45', columns profile_{id}, values in MW).
 
-    run_digital_twin ne genere plus rien en interne : il RECOIT ce CSV et
-    l'utilise tel quel. Cette fonction encapsule la logique
-    _build_load_profiles_banque_mensuelle (restee dans digital_twin.py, aussi
-    reutilisee par pv_injection.py) et la materialise sur disque.
+    run_digital_twin receives this CSV and uses it as-is. This function wraps
+    _build_load_profiles_banque_mensuelle (kept in digital_twin.py, also reused
+    by pv_injection.py) and materializes its output on disk.
 
     Parameters
     ----------
-    mois_simule : str | int   -- mois cible de la banque (nom francais ou 1-12)
-    households : pd.DataFrame, optionnel -- households.csv (lu depuis data_path si None)
-    config : dict, optionnel  -- surcharge (seed, bank_path, ...) ; mois_simule
-                                  est impose par l'argument du meme nom
-    out_path : str            -- chemin du CSV genere (data/load_profiles.csv)
+    mois_simule : str | int   -- target month of the bank (French name or 1-12)
+    households : pd.DataFrame, optional -- households.csv (read from data_path if None)
+    config : dict, optional   -- overrides (seed, bank_path, ...); mois_simule is
+                                  forced by the argument of the same name
+    out_path : str            -- path of the generated CSV (data/load_profiles.csv)
 
     Returns
     -------
     (load_profiles : pd.DataFrame, warnings : list[str])
     """
-    # Import local pour eviter tout cycle a l'import du module (digital_twin
-    # n'importe pas consumption_bank, mais on garde l'import au plus pres de
-    # l'usage). _build_load_profiles_banque_mensuelle reste la source unique de
-    # la logique de tirage (une seule implementation, partagee).
+    # Local import to avoid any import cycle (digital_twin does not import
+    # consumption_bank; the import is kept close to its use).
+    # _build_load_profiles_banque_mensuelle is the single source of the draw
+    # logic (one shared implementation).
     from sourcecode.digital_twin import (
         _build_load_profiles_banque_mensuelle, _config_to_dict,
     )
@@ -188,10 +179,10 @@ def generate_load_profiles(mois_simule, households=None, config=None,
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     load_profiles.to_csv(out_path)
 
-    # Aller-retour : le CSV ecrit doit etre relu IDENTIQUE par main.py, qui lit
-    # via pd.read_csv(out_path, index_col=0). On rejoue exactement cette lecture
-    # et on compare (index, colonnes, valeurs) -- garde-fou contre une derive de
-    # format (separateur, encodage, precision) entre ecriture et relecture.
+    # Round-trip: the written CSV must be read back IDENTICALLY by main.py, which
+    # reads via pd.read_csv(out_path, index_col=0). Replay exactly that read and
+    # compare (index, columns, values) -- a guardrail against any format drift
+    # (separator, encoding, precision) between write and read.
     reread = pd.read_csv(out_path, index_col=0)
     same = (
         list(reread.index) == list(load_profiles.index)

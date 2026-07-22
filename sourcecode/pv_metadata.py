@@ -1,41 +1,36 @@
 """
-Volet PV -- Brique 1 : generation des metadonnees d'installations PV.
+PV volet -- Brick 1: PV installation metadata generation.
 
-Genere data/pv_installations.csv : quel bus residentiel porte une
-installation PV et de quelle taille, plus une installation fixe sur la
-maison de repos. Ne fait AUCUNE injection dans pandapower ni calcul de
-production -- uniquement les metadonnees, consommees par les briques
-suivantes (production, injection).
+Generates data/pv_installations.csv: which residential bus carries a PV
+installation and of what size, plus one fixed installation on the rest home.
+Performs NO pandapower injection and NO production computation -- only the
+metadata, consumed by the following bricks (production, injection).
 
-Ne modifie pas digital_twin.py : reutilise _build_network() et
-_config_to_dict() en LECTURE SEULE pour obtenir la topologie reelle
-(bus_id <-> rue), garantissant que les bus_id generes ici correspondent
-exactement a ceux du reseau reel (pas de reimplementation risquant un ecart
-avec le vrai bus_id pandapower).
+Reuses _build_network() and _config_to_dict() READ-ONLY to obtain the real
+topology (bus_id <-> street), so the bus_ids generated here match exactly those
+of the real network (no reimplementation that could drift from the true
+pandapower bus_id).
 
-Prerequis verifie avant tout code (cf. brief) : le lien bus -> rue existe-t-il
-et est-il exploitable pour les 333 bus residentiels ?
-  - households.csv : NON exploitable pour ce besoin -- ne connait que 3 rues
-    (Avenue Joseph Merlot / Rue Ernest Malvoz / Plateau du Bouhay), un
-    decoupage simplifie utilise pour l'assignation de profils de conso, sans
-    rapport avec la topologie physique complete.
-  - colonne 'street' de consumption_bank_real_weeks.parquet : NON exploitable
-    non plus -- limitee aux rues des 33 EAN mesures (meme sous-ensemble que
-    ci-dessus, cf. sourcecode/consumption_bank.py).
-  - _build_network()['buses'] (digital_twin.py) : EXPLOITABLE et faisant
-    autorite -- dict (street, num) -> bus_id, verifie couvrant exactement
-    les 333 bus residentiels reels sur 7 vraies rues (Avenue Joseph Merlot
-    106, Rue Ernest Malvoz 83, Plateau du Bouhay 54, Rue des Primeroses 30,
-    Rue des Bluets 21, Rue Simon Burnet 20, Rue Joseph Lambremont 19).
-    C'est la source de verite car c'est litteralement ce que la
-    reconstruction du reseau utilise (derive de coordonnées.csv).
-Aucun repli aleatoire uniforme necessaire : le lien exact existe.
+The bus -> street link must exist and be usable for the 333 residential buses:
+  - households.csv: NOT usable for this -- it only knows 3 streets (Avenue
+    Joseph Merlot / Rue Ernest Malvoz / Plateau du Bouhay), a simplified split
+    used for load-profile assignment, unrelated to the full physical topology.
+  - 'street' column of consumption_bank_real_weeks.parquet: NOT usable either
+    -- limited to the streets of the 33 measured EANs (same subset as above,
+    see sourcecode/consumption_bank.py).
+  - _build_network()['buses'] (digital_twin.py): USABLE and authoritative --
+    dict (street, num) -> bus_id, covering exactly the 333 real residential
+    buses across 7 real streets (Avenue Joseph Merlot 106, Rue Ernest Malvoz
+    83, Plateau du Bouhay 54, Rue des Primeroses 30, Rue des Bluets 21, Rue
+    Simon Burnet 20, Rue Joseph Lambremont 19). It is the source of truth
+    because it is literally what the network reconstruction uses (derived from
+    coordonnées.csv). No uniform random fallback needed: the exact link exists.
 
-Calibrage terrain : un retour utilisateur (visite de site) indique des PV
-observes plus souvent Rue Ernest Malvoz que sur Plateau du Bouhay. Reflete
-via `street_weights` (poids de tirage par rue, defaut 1.0 partout sauf Rue
-Ernest Malvoz = 3.0) -- un biais probabiliste, pas une garantie deterministe
-(cf. DEFAULTS et generate_pv_metadata).
+Field calibration: a user report (site visit) indicates PV observed more often
+on Rue Ernest Malvoz than on Plateau du Bouhay. Reflected via `street_weights`
+(per-street draw weight, default 1.0 everywhere except Rue Ernest Malvoz = 3.0)
+-- a probabilistic bias, not a deterministic guarantee (see DEFAULTS and
+generate_pv_metadata).
 """
 import os
 from collections import defaultdict
@@ -52,29 +47,28 @@ DEFAULTS = {
     "kwp_residential": 3.0,
     "kwp_rest_home": 12.0,
     "seed": 42,
-    "n_streets_range": (2, 4),     # nombre de rues "grappe" equipees, tire dans cet intervalle
-    "min_street_size": 5,          # exclut du tirage les rues trop petites (garde-fou ;
-                                    # jamais declenche avec les 7 rues reelles, 19-106 bus chacune)
-    # Poids relatif de tirage par rue (defaut 1.0 pour toute rue absente de
-    # ce dict). Calibrage QUALITATIF sur un retour terrain (visite de site,
-    # utilisateur) : PV observes plus souvent Rue Ernest Malvoz que sur
-    # Plateau du Bouhay -- pas une statistique precise (aucun comptage
-    # exhaustif fourni), juste une tendance a refleter. Poids=3.0 rend cette
-    # rue ~3x plus susceptible d'etre tiree qu'une rue neutre, sans jamais la
-    # forcer (le tirage reste probabiliste, seed pilote) -- ajuster ici si
-    # une meilleure estimation (comptage reel, etc.) devient disponible.
+    "n_streets_range": (2, 4),     # number of equipped "cluster" streets, drawn in this range
+    "min_street_size": 5,          # excludes streets too small from the draw (guardrail;
+                                    # never triggered with the 7 real streets, 19-106 buses each)
+    # Relative per-street draw weight (default 1.0 for any street absent from
+    # this dict). QUALITATIVE calibration from a field report (site visit): PV
+    # observed more often on Rue Ernest Malvoz than on Plateau du Bouhay -- not
+    # a precise statistic (no exhaustive count provided), just a tendency to
+    # reflect. Weight=3.0 makes this street ~3x more likely to be drawn than a
+    # neutral one, without ever forcing it (the draw stays probabilistic,
+    # seed-driven) -- adjust here if a better estimate (real count) becomes available.
     "street_weights": {"Rue Ernest Malvoz": 3.0},
-    "rest_home_name": "Paradis du Bouhay",  # cf. digital_twin.MV_PASSAGE
+    "rest_home_name": "Paradis du Bouhay",  # see digital_twin.MV_PASSAGE
     "out_path": OUT_PATH,
 }
 
 
 def _allocate_across_streets(sizes, total, rng):
-    """Repartit `total` installations entre des rues de tailles `sizes`, au
-    prorata de leur taille, sans jamais depasser la taille d'une rue (evite
-    l'absurdite "3 installations sur une rue de 2 maisons"). Le reste
-    (arrondi) est distribue 1 par 1, dans un ordre permute aleatoirement,
-    aux rues qui ont encore de la place.
+    """Distribute `total` installations across streets of sizes `sizes`, in
+    proportion to their size, never exceeding a street's size (avoids the
+    absurdity of "3 installations on a street of 2 houses"). The (rounded)
+    remainder is handed out one by one, in a random permuted order, to the
+    streets that still have room.
     """
     sizes = np.asarray(sizes, dtype=float)
     if total > sizes.sum():
@@ -102,45 +96,43 @@ def _allocate_across_streets(sizes, total, rng):
 
 
 def generate_pv_metadata(config=None):
-    """Genere data/pv_installations.csv (ou cfg['out_path']).
+    """Generate data/pv_installations.csv (or cfg['out_path']).
 
-    Placement residentiel : GROUPE PAR RUE (grappes), pas uniforme -- tire
-    `n_streets` rues (nombre tire dans n_streets_range, seed pilote), puis
-    repartit n_installations entre elles au prorata de leur taille reelle
-    (cf. _allocate_across_streets), avant de tirer, DANS chaque rue choisie,
-    les bus precis a equiper (sans remise, seed pilote). Intention (cf.
-    brief) : quelques rues fortement equipees plutot qu'une dispersion
-    homogene -- effet voisinage/installateur, stress reseau localise sur un
-    meme depart BT.
+    Residential placement: GROUPED BY STREET (clusters), not uniform -- draw
+    `n_streets` streets (count drawn in n_streets_range, seed-driven), then
+    distribute n_installations across them in proportion to their real size
+    (see _allocate_across_streets), before drawing, WITHIN each chosen street,
+    the exact buses to equip (without replacement, seed-driven). Intent: a few
+    heavily equipped streets rather than a homogeneous spread -- neighbourhood/
+    installer effect, localized network stress on a single LV feeder.
 
-    Si les rues tirees en premier n'ont pas assez de capacite cumulee pour
-    n_installations, la selection s'etend a d'autres rues eligibles (ordre
-    permute) jusqu'a couvrir la demande -- jamais declenche avec les 7 rues
-    reelles et les valeurs par defaut, mais evite un crash silencieux pour
-    des parametres extremes.
+    If the first-drawn streets do not have enough cumulative capacity for
+    n_installations, the selection extends to other eligible streets (permuted
+    order) until demand is met -- never triggered with the 7 real streets and the
+    defaults, but avoids a silent crash for extreme parameters.
 
-    La maison de repos (`rest_home_name`) est ajoutee en dur, HORS du tirage
-    residentiel, avec kwp_rest_home et type='rest_home'. Son bus_id est
-    celui de son bus MV de passage existant (le meme bus que sa charge de
-    consommation dans _assign_loads) -- pas de rue associee (colonne 'street'
-    vide), puisqu'elle n'appartient pas au systeme de rues residentielles.
+    The rest home (`rest_home_name`) is added explicitly, OUTSIDE the residential
+    draw, with kwp_rest_home and type='rest_home'. Its bus_id is that of its
+    existing MV passage bus (the same bus as its consumption load in
+    _assign_loads) -- no associated street ('street' column empty), since it does
+    not belong to the residential street system.
 
-    Parameters (cfg, tous optionnels -- defauts dans DEFAULTS)
+    Parameters (cfg, all optional -- defaults in DEFAULTS)
     ----------
-    n_installations : int    -- nombre d'installations residentielles (30)
-    kwp_residential : float  -- taille residentielle fixe [kWp] (3.0)
-    kwp_rest_home : float    -- taille maison de repos [kWp] (12.0)
-    seed : int               -- reproductibilite du tirage (42)
+    n_installations : int    -- number of residential installations (30)
+    kwp_residential : float  -- fixed residential size [kWp] (3.0)
+    kwp_rest_home : float    -- rest home size [kWp] (12.0)
+    seed : int               -- draw reproducibility (42)
 
     Returns
     -------
-    pd.DataFrame : le contenu ecrit dans le CSV (bus_id, kwp, type, street).
+    pd.DataFrame : the content written to the CSV (bus_id, kwp, type, street).
     """
     cfg = dict(DEFAULTS)
     if config:
         cfg.update(config)
 
-    net_cfg = _config_to_dict(None)  # topologie fixe, independante des parametres PV
+    net_cfg = _config_to_dict(None)  # fixed topology, independent of PV parameters
     net, buses, mv_nodes, validation = _build_network(net_cfg)
 
     buses_by_street = defaultdict(list)
@@ -154,10 +146,10 @@ def generate_pv_metadata(config=None):
     n_streets = int(rng.integers(lo, hi + 1))
     n_streets = min(n_streets, len(eligible_streets))
 
-    # Ordre de tirage PONDERE (sans remise) plutot qu'une permutation
-    # uniforme : les rues avec un poids > 1.0 (cf. street_weights) ont plus
-    # de chances d'apparaitre tot dans l'ordre, donc d'etre choisies comme
-    # rue "grappe" -- sans jamais garantir leur presence (reste probabiliste).
+    # WEIGHTED draw order (without replacement) rather than a uniform
+    # permutation: streets with a weight > 1.0 (see street_weights) are more
+    # likely to appear early in the order, hence to be chosen as "cluster"
+    # streets -- without ever guaranteeing their presence (stays probabilistic).
     street_weights = cfg.get("street_weights") or {}
     weights = np.array([street_weights.get(s, 1.0) for s in eligible_streets], dtype=float)
     probs = weights / weights.sum()
@@ -193,31 +185,29 @@ def generate_pv_metadata(config=None):
 
 
 def extend_pv_metadata(base_installations, n_additional, config=None, out_path=None):
-    """Volet PV -- Brique 4 : étend un parc PV existant de `n_additional`
-    installations résidentielles supplémentaires, en PRÉSERVANT les
-    installations existantes À L'IDENTIQUE (mêmes bus_id) -- PAS un tirage
-    indépendant. Nécessaire pour comparer des taux de pénétration (30 vs 50)
-    sans mélanger effet de taux et effet de placement (cf. brief brique 4).
+    """PV volet -- Brick 4: extend an existing PV fleet by `n_additional` extra
+    residential installations, PRESERVING the existing installations IDENTICALLY
+    (same bus_id) -- NOT an independent draw. Needed to compare penetration rates
+    (30 vs 50) without mixing rate effect and placement effect.
 
-    Logique (même esprit "grappes par rue" que generate_pv_metadata) :
-    étend EN PRIORITÉ les rues déjà équipées (au prorata de leur capacité
-    RESTANTE, pas de leur taille totale), pour renforcer les clusters
-    existants plutôt que d'en semer de nouveaux. Si leur capacité résiduelle
-    ne suffit pas, pioche de nouvelles rues via le même mécanisme pondéré
-    (`street_weights`) que generate_pv_metadata -- jamais déclenché avec les
-    valeurs par défaut (30->50 sur 2 rues à 106+30 bus, largement assez de
-    marge), mais garde-fou pour des extensions plus importantes (80, 100).
+    Logic (same "clusters by street" spirit as generate_pv_metadata): extend the
+    already-equipped streets FIRST (in proportion to their REMAINING capacity,
+    not their total size), to reinforce existing clusters rather than seed new
+    ones. If their residual capacity is not enough, pick new streets via the same
+    weighted mechanism (`street_weights`) as generate_pv_metadata -- never
+    triggered with the defaults (30->50 on 2 streets of 106+30 buses, ample
+    margin), but a guardrail for larger extensions (80, 100).
 
     Parameters
     ----------
-    base_installations : pd.DataFrame -- parc existant (ex. pv_installations.csv)
-    n_additional : int                -- nombre d'installations residentielles a ajouter
-    config : dict, optionnel          -- memes cles que DEFAULTS (seed, street_weights, ...)
-    out_path : str, optionnel         -- si fourni, ecrit le CSV etendu
+    base_installations : pd.DataFrame -- existing fleet (e.g. pv_installations.csv)
+    n_additional : int                -- number of residential installations to add
+    config : dict, optional           -- same keys as DEFAULTS (seed, street_weights, ...)
+    out_path : str, optional          -- if provided, writes the extended CSV
 
     Returns
     -------
-    pd.DataFrame : parc complet (existant + nouvelles + maison de repos), meme schema.
+    pd.DataFrame : full fleet (existing + new + rest home), same schema.
     """
     cfg = dict(DEFAULTS)
     if config:
@@ -236,8 +226,8 @@ def extend_pv_metadata(base_installations, n_additional, config=None, out_path=N
 
     rng = np.random.default_rng(cfg["seed"])
 
-    # 1) Etendre en priorite les rues deja equipees, au prorata de leur
-    #    capacite RESTANTE (bus pas encore equipes).
+    # 1) Extend the already-equipped streets first, in proportion to their
+    #    REMAINING capacity (buses not yet equipped).
     remaining_in_existing = {
         s: [b for b in buses_by_street[s] if int(b) not in existing_bus_ids]
         for s in existing_streets
@@ -257,8 +247,7 @@ def extend_pv_metadata(base_installations, n_additional, config=None, out_path=N
                 new_rows.append({"bus_id": int(b), "kwp": cfg["kwp_residential"],
                                  "type": "residential", "street": street})
 
-    # 2) Si insuffisant (pas declenche avec 30->50/80/100 sur les rues
-    #    reelles), pioche de nouvelles rues via le meme mecanisme pondere.
+    # 2) If not enough, pick new streets via the same weighted mechanism.
     still_needed = n_additional - n_from_existing
     if still_needed > 0:
         eligible_streets = [s for s, bs in buses_by_street.items()

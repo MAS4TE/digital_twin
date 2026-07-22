@@ -1,34 +1,30 @@
 """
-Volet PV -- Brique 3 : injection des installations PV comme sgen sur le
-réseau, à partir de pv_installations.csv (brique 1) et des profils de
-production build_pv_production() (brique 2).
+PV volet -- Brick 3: multi-scenario orchestration for injecting PV as sgen on
+the network, from pv_installations.csv (brick 1) and the production profiles of
+build_pv_production() (brick 2).
 
-Architecture "réseau de base pré-construit + couche PV" (cf. brief) :
-_build_network() est appelé UNE SEULE FOIS (net_base) -- c'est la lecture du
-CSV brut de 335 Mo qui coûte ~14s, PAS la construction mémoire pandapower
-elle-même (mesuré dans scripts/check_pv_injection.py : le deepcopy est de
-l'ordre de quelques centièmes de seconde, cf. NEXT_STEPS.md). Chaque
-scénario travaille sur une copy.deepcopy(net_base), jamais sur net_base
-directement, pour ne jamais accumuler de sgen/load entre scénarios.
+"Pre-built base network + PV layer" architecture: _build_network() is called
+ONCE (net_base) -- the cost is reading the 335 MB raw CSV (~14s), NOT the
+pandapower in-memory build itself (the deepcopy is a few hundredths of a second).
+Each scenario works on a copy.deepcopy(net_base), never on net_base directly, so
+sgen/load never accumulate across scenarios.
 
-Inversion de dependance (refonte PV natif) : la logique d'injection PROPREMENT
-DITE (injection sgen, verif d'alignement, power flow charges+PV) vit desormais
-dans digital_twin.py -- _inject_pv_sgens / _verify_temporal_alignment /
-_run_powerflow. Ce module les IMPORTE (source unique, aucune duplication) et
-ne garde que l'orchestration multi-scenarios (build_base_network + deepcopy,
-verify_bus_ids sur les metadonnees, run_pv_scenario) utile a l'analyse
-d'impact (scripts/pv_impact_analysis.py). Reutilise aussi _build_network,
-_assign_loads, _build_load_profiles_banque_mensuelle, _config_to_dict.
+The injection logic proper (sgen injection, alignment check, loads+PV power flow)
+lives in digital_twin.py -- _inject_pv_sgens / _verify_temporal_alignment /
+_run_powerflow. This module IMPORTS them (single source, no duplication) and
+keeps only the multi-scenario orchestration (build_base_network + deepcopy,
+verify_bus_ids on the metadata, run_pv_scenario) used by the impact analysis
+(scripts/pv_impact_analysis.py). Also reuses _build_network, _assign_loads,
+_build_load_profiles_banque_mensuelle, _config_to_dict.
 
-Convention générateur : p_mw POSITIF = injection (PAS un load négatif) --
-comportement natif de pandapower pour les éléments `sgen` (contrairement à
-`load`, où p_mw positif = consommation) : aucune inversion de signe à faire
-nous-mêmes, juste ne pas utiliser `create_load` avec un p_mw négatif.
+sgen convention: p_mw POSITIVE = injection (NOT a negative load) -- pandapower's
+native behaviour for `sgen` elements (unlike `load`, where positive p_mw =
+consumption): no sign inversion to do ourselves, just do not use `create_load`
+with a negative p_mw.
 
-q_mvar=0 pour tous les sgen PV en v1 -- hypothèse documentée : les onduleurs
-résidentiels/tertiaires injectent essentiellement de l'actif au point de
-fonctionnement nominal ; un contrôle Q (cos phi variable, Q(V), ...) serait
-un raffinement de brique ultérieure, pas fait ici.
+q_mvar=0 for all PV sgens -- documented assumption: residential/tertiary
+inverters inject essentially active power at the nominal operating point; a Q
+control (variable cos phi, Q(V), ...) would be a later refinement, not done here.
 """
 import copy
 
@@ -45,14 +41,13 @@ IRRADIANCE_PATH = "data/pvgis_irradiance_quarter_hourly.parquet"
 
 
 def build_base_network(config=None):
-    """Construit le réseau UNE fois -- à réutiliser via copy.deepcopy() pour
-    chaque scénario (jamais modifié directement).
+    """Build the network ONCE -- reuse it via copy.deepcopy() for each scenario
+    (never modified directly).
 
-    `buses` (dict (rue,num)->bus_id) et `mv_nodes` (dict nom->bus_id) restent
-    valables pour TOUTE copie de net_base : ce sont des indices entiers de
-    bus pandapower, inchangés par un deepcopy (le deepcopy clone les
-    DataFrames de net, pas les clés/valeurs de ces dicts externes -- pas
-    besoin de les recopier ni de les reconstruire par scénario).
+    `buses` (dict (street,num)->bus_id) and `mv_nodes` (dict name->bus_id) stay
+    valid for ANY copy of net_base: they are integer pandapower bus indices,
+    unchanged by a deepcopy (the deepcopy clones net's DataFrames, not the keys/
+    values of these external dicts -- no need to copy or rebuild them per scenario).
     """
     net_cfg = _config_to_dict(config)
     net_base, buses, mv_nodes, validation = _build_network(net_cfg)
@@ -60,11 +55,11 @@ def build_base_network(config=None):
 
 
 def verify_bus_ids(pv_installations, buses, mv_nodes):
-    """Vérifie que chaque bus_id du CSV PV correspond à un bus réel du
-    réseau : résidentiel via `buses` (333 bus), OU bus MV de passage via
-    `mv_nodes` (cas de la maison de repos, hors coordonnées résidentielles).
-    Lève une erreur claire plutôt qu'un échec silencieux ou un crash
-    pandapower opaque plus loin dans l'injection.
+    """Check that each bus_id of the PV CSV matches a real network bus:
+    residential via `buses` (333 buses), OR an MV passage bus via `mv_nodes`
+    (the rest home case, outside the residential coordinates). Raise a clear
+    error rather than a silent failure or an opaque pandapower crash later in
+    the injection.
     """
     valid_bus_ids = set(int(b) for b in buses.values()) | set(int(b) for b in mv_nodes.values())
     pv_bus_ids = set(int(b) for b in pv_installations["bus_id"])
@@ -85,33 +80,31 @@ def verify_bus_ids(pv_installations, buses, mv_nodes):
 
 def run_pv_scenario(net_base, buses, mv_nodes, households, pv_installations, irradiance,
                      config=None, run_powerflow=True):
-    """Exécute un scénario complet (charges + PV) sur une COPIE de
-    net_base -- net_base n'est JAMAIS modifié.
+    """Run a full scenario (loads + PV) on a COPY of net_base -- net_base is
+    NEVER modified.
 
-    `config['mois_simule']` pilote À LA FOIS la sous-banque de conso
-    (`_build_load_profiles_banque_mensuelle`) et le mois de production PV
-    (`build_pv_production`) -- un seul paramètre, cohérence saisonnière
-    garantie par construction (pas deux réglages à synchroniser à la main).
+    `config['mois_simule']` drives BOTH the load sub-bank
+    (`_build_load_profiles_banque_mensuelle`) and the PV production month
+    (`build_pv_production`) -- a single parameter, seasonal consistency
+    guaranteed by construction (no two settings to keep in sync by hand).
 
     Parameters
     ----------
-    run_powerflow : bool -- si False, prépare tout (loads, sgen, profils,
-        vérification d'alignement) mais NE LANCE PAS le power flow --
-        utile pour les vérifications d'injection pure (brique 3) sans payer
-        le coût du timeseries à chaque test.
+    run_powerflow : bool -- if False, prepares everything (loads, sgen, profiles,
+        alignment check) but does NOT run the power flow -- useful for pure
+        injection checks without paying the timeseries cost each time.
 
     Returns
     -------
     dict : net, sgen_bus, bus_to_profile, df_load_p, df_load_q, df_sgen_p,
-           et si run_powerflow=True : vm, line_load, trafo_load, sgen_p_out.
+           and if run_powerflow=True: vm, line_load, trafo_load, sgen_p_out.
     """
     cfg = _config_to_dict(config)
     net = copy.deepcopy(net_base)
 
-    # Charges via la banque mensuelle (le commutateur methode_affectation a ete
-    # retire du twin ; run_digital_twin recoit desormais load_profiles tel quel.
-    # run_pv_scenario s'appuie toujours sur la banque pour l'analyse d'impact --
-    # passer load_profiles CSV directement a run_digital_twin si necessaire).
+    # Loads via the monthly bank. run_digital_twin receives load_profiles as-is;
+    # run_pv_scenario relies on the bank for the impact analysis (pass a
+    # load_profiles CSV directly to run_digital_twin if needed).
     load_profiles_for_assignment, w_bank = _build_load_profiles_banque_mensuelle(households, cfg)
     load_profiles_for_assignment = load_profiles_for_assignment * cfg['load_scale']
 
@@ -119,16 +112,16 @@ def run_pv_scenario(net_base, buses, mv_nodes, households, pv_installations, irr
         net, buses, mv_nodes, households, load_profiles_for_assignment, cfg)
 
     prod_kw = build_pv_production(cfg['mois_simule'], pv_installations, irradiance)
-    # kW -> MW. build_pv_production() garde l'index texte 'Mon 00:00'.. ; on le
-    # ramene sur un RangeIndex positionnel, identique a df_load_p (qui a perdu
-    # l'index texte via `.values` dans _assign_loads). C'est cet index
-    # positionnel qui fait foi au runtime (DFData/ConstControl indexent par
-    # position via time_steps=range(n_timesteps)).
+    # kW -> MW. build_pv_production() keeps the text index 'Mon 00:00'..; put it
+    # on a positional RangeIndex, identical to df_load_p (which lost the text
+    # index via `.values` in _assign_loads). That positional index is what
+    # matters at runtime (DFData/ConstControl index by position via
+    # time_steps=range(n_timesteps)).
     df_sgen_p = (prod_kw / 1000.0).reset_index(drop=True)
     df_load_p_aligned = df_load_p.reset_index(drop=True)
 
-    _verify_temporal_alignment(df_load_p_aligned, df_sgen_p)   # garde-fou index
-    sgen_bus = _inject_pv_sgens(net, df_sgen_p)                # sgen a partir des colonnes 'pv_{bus_id}'
+    _verify_temporal_alignment(df_load_p_aligned, df_sgen_p)   # index guardrail
+    sgen_bus = _inject_pv_sgens(net, df_sgen_p)                # sgen from the 'pv_{bus_id}' columns
 
     result = {
         "net": net, "sgen_bus": sgen_bus, "bus_to_profile": bus_to_profile,
