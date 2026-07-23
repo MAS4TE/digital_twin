@@ -133,7 +133,7 @@ def generate_pv_metadata(config=None):
         cfg.update(config)
 
     net_cfg = _config_to_dict(None)  # fixed topology, independent of PV parameters
-    net, buses, mv_nodes, validation = _build_network(net_cfg)
+    net, buses, mv_nodes, validation, _ = _build_network(net_cfg)
 
     buses_by_street = defaultdict(list)
     for (street, num), b in buses.items():
@@ -214,7 +214,7 @@ def extend_pv_metadata(base_installations, n_additional, config=None, out_path=N
         cfg.update(config)
 
     net_cfg = _config_to_dict(None)
-    net, buses, mv_nodes, validation = _build_network(net_cfg)
+    net, buses, mv_nodes, validation, _ = _build_network(net_cfg)
     buses_by_street = defaultdict(list)
     for (street, num), b in buses.items():
         buses_by_street[street].append(b)

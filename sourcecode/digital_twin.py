@@ -350,7 +350,10 @@ def _build_network(config):
     buses : dict           # (street, num) -> LV bus id  (charge buses)
     mv_nodes : dict        # name -> MV bus id  (SLACK + substations + passage)
     validation : dict      # coordinate-vs-schema distance check
+    warnings : list[str]   # non-fatal topology issues (skipped GUESS_LINKS,
+                            # CHAIN_LINK_DROPS that matched nothing)
     """
+    warnings = []
     data_path = config['data_path']
 
     # --- Load raw data ---
@@ -430,10 +433,24 @@ def _build_network(config):
                 )
 
     def _drop_line_by_name(name):
-        net.line.drop(net.line[net.line["name"] == name].index, inplace=True)
+        """Drop the line called `name`; return how many lines were actually
+        dropped (0 when none matched, which pandas does silently)."""
+        idx = net.line[net.line["name"] == name].index
+        net.line.drop(idx, inplace=True)
+        return len(idx)
 
     # --- Cross-street links for streets without a directly known substation ---
+    # Tolerant lookup: both endpoints are identified by OSM @id and may be
+    # absent from df_coords (or filtered out upstream). Skip the link with a
+    # warning rather than raising, so a partial network still builds.
     for id_a, id_b, label in GUESS_LINKS:
+        missing = [i for i in (id_a, id_b) if i not in bus_by_id]
+        if missing:
+            warnings.append(
+                f"GUESS_LINK '{label}' skipped: endpoint(s) absent from the "
+                f"network (OSM @id {missing})."
+            )
+            continue
         bus_a, bus_b = bus_by_id[id_a], bus_by_id[id_b]
         pp.create_line_from_parameters(
             net, from_bus=bus_a, to_bus=bus_b,
@@ -443,8 +460,15 @@ def _build_network(config):
         )
 
     # --- Drop redundant / loop-forming chain links ---
+    # A drop that matches nothing is a no-op pandas performs silently, and the
+    # radiality it was meant to enforce is then lost without a trace -> warn.
     for street, num_a, num_b in CHAIN_LINK_DROPS:
-        _drop_line_by_name(f"{street}_{num_a}_to_{num_b}")
+        line_name = f"{street}_{num_a}_to_{num_b}"
+        if _drop_line_by_name(line_name) == 0:
+            warnings.append(
+                f"CHAIN_LINK_DROP '{line_name}' had no effect: no such line in "
+                "the network (radiality no longer guaranteed at this point)."
+            )
 
     # --- One transformer + one LV secondary bus per real substation ---
     for name in MV_SUBSTATIONS:
@@ -513,7 +537,7 @@ def _build_network(config):
             for i in (idx_min, other_idx):
                 _connect(seg_buses[i], f"{base_name}_n{seg.loc[i, 'num']}")
 
-    return net, buses, mv_nodes, validation
+    return net, buses, mv_nodes, validation, warnings
 
 
 # ============================================================
@@ -936,7 +960,8 @@ def run_digital_twin(config, households, load_profiles,
     warnings = _validate_inputs(cfg, households, load_profiles,
                                 pv_profiles, schedules_BSS)
 
-    net, buses, mv_nodes, validation = _build_network(cfg)
+    net, buses, mv_nodes, validation, w_net = _build_network(cfg)
+    warnings += w_net
 
     # Generation / execution separation: run_digital_twin does not generate
     # profiles internally -- it RECEIVES `load_profiles` (produced upstream, see
