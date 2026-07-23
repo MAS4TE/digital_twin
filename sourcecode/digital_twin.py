@@ -147,6 +147,27 @@ CHAIN_LINK_DROPS = [
 # stay at zero load (warning).
 MV_PASSAGE_PROFILES_FILE = "mv_passage_profiles.csv"
 
+# Network size -> coordinates file read by _build_network, selected by
+# config['network_size']. Each file is a filtered copy of the reference
+# coordinates (same columns, same tab separator) keeping only the buses of the
+# retained substation segments, PLUS the 3 MV passage rows of MV_PASSAGE_IDS,
+# which the MV backbone needs whatever the size.
+#   small  -> GROTTES segments only                        (54 buses)
+#   medium -> TROULOUETTE + CIMETIERE BRESSOUX segments    (106 buses)
+#   full   -> the whole reference file                     (333 buses)
+#
+# These are TOPOLOGY data, shipped with the module: they live in
+# sourcecode/data/ and are resolved relative to THIS file, not to the current
+# working directory and not via config['data_path'] (which stays the knob for
+# SCENARIO data, e.g. mv_passage_profiles.csv). Regenerate them with
+# scripts/generate_network_coordinates.py.
+NETWORK_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+NETWORK_SIZE_FILES = {
+    "small":  "coordinates_small.csv",
+    "medium": "coordinates_medium.csv",
+    "full":   "coordinates_full.csv",
+}
+
 # Street -> substation LV secondary bus mapping: (substation, street, parity, low_bound, high_bound).
 # bound = None when the segment spans the whole street. The boundary between
 # shared segments (Avenue Joseph Merlot) coincides with the Plantations passage node.
@@ -354,13 +375,21 @@ def _build_network(config):
                             # CHAIN_LINK_DROPS that matched nothing)
     """
     warnings = []
-    data_path = config['data_path']
 
     # --- Load raw data ---
-    # The raw meter CSV is NOT read here: the network topology derives entirely
-    # from df_coords. The EAN filter (total_cons >= 365) lives where it is
-    # actually consumed, in consumption_bank.build_consumption_bank.
-    df_coords = pd.read_csv(data_path + "coordonnées.csv", sep='\t')
+    # config['data_path'] is NOT used here: the coordinates ship with the module
+    # (NETWORK_DATA_DIR). The raw meter CSV is not read either -- the topology
+    # derives entirely from df_coords, and the EAN filter (total_cons >= 365)
+    # lives where it is actually consumed, in
+    # consumption_bank.build_consumption_bank.
+    size = config['network_size']
+    if size not in NETWORK_SIZE_FILES:
+        raise ValueError(
+            f"config['network_size'] ({size!r}) is unknown: expected one of "
+            f"{sorted(NETWORK_SIZE_FILES)}."
+        )
+    coords_path = os.path.join(NETWORK_DATA_DIR, NETWORK_SIZE_FILES[size])
+    df_coords = pd.read_csv(coords_path, sep='\t')
 
     # --- Housenumber / parity parsing ---
     df_coords["addr:housenumber"] = df_coords["addr:housenumber"].replace("", None)
@@ -512,6 +541,17 @@ def _build_network(config):
         if hi is not None:
             seg = seg[seg["num"] <= hi]
         seg = seg.sort_values("num").reset_index(drop=True)
+
+        # A reduced coordinates file (config['network_size']) leaves the segments
+        # of the dropped substations empty. Skip them with a warning: their
+        # transformer and LV secondary bus stay in the network, unloaded.
+        if len(seg) == 0:
+            warnings.append(
+                f"Segment '{sub_name} / {street} / {parity}' is empty at "
+                f"network_size='{config['network_size']}': no LV feeder attached "
+                "to this substation for that segment."
+            )
+            continue
 
         lv_bus = cabine_lv_bus[sub_name]
         mv_bus = mv_nodes[sub_name]
@@ -997,6 +1037,10 @@ def run_digital_twin(config, households, load_profiles,
     agg_summary, agg_mw = _aggregate_profile_summary(df_p)
     summary.update(agg_summary)
 
+    # Which network the verdict applies to (see NETWORK_SIZE_FILES): a verdict
+    # read without it would be ambiguous between the three sizes.
+    summary['network_size'] = cfg['network_size']
+
     out = _format_output(summary, violations, warnings)
 
     # Optional export of the full aggregate profile (672 steps), off by default
@@ -1021,6 +1065,9 @@ def _config_to_dict(config):
         'cos_phi': 0.95,
         'trafo_sn_mva': 0.22,
         'data_path': 'data/',
+        # Network size: selects the coordinates file read by _build_network
+        # (see NETWORK_SIZE_FILES). 'full' = the whole Bressoux network.
+        'network_size': 'full',
         'seed': RANDOM_SEED,                  # exposed for reproducible comparisons
         # mois_simule / bank_path: GENERATION parameters (monthly bank). The twin
         # does not read them itself; they are defaults for
