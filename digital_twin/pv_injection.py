@@ -30,11 +30,11 @@ import copy
 
 import pandas as pd
 
-from sourcecode.digital_twin import (
+from digital_twin.digital_twin import (
     _build_network, _assign_loads, _build_load_profiles_banque_mensuelle, _config_to_dict,
     _inject_pv_sgens, _verify_temporal_alignment, _run_powerflow,
 )
-from sourcecode.pv_production import build_pv_production
+from digital_twin.pv_production import build_pv_production
 
 PV_INSTALLATIONS_PATH = "data/pv_installations.csv"
 IRRADIANCE_PATH = "data/pvgis_irradiance_quarter_hourly.parquet"
@@ -73,7 +73,7 @@ def verify_bus_ids(pv_installations, buses, mv_nodes):
         if bus_id not in set(int(b) for b in mv_nodes.values()):
             raise ValueError(
                 f"Maison de repos : bus_id={bus_id} n'est pas un bus MV de passage connu "
-                f"({sorted(mv_nodes.keys())}) -- verifier la coherence avec sourcecode/pv_metadata.py."
+                f"({sorted(mv_nodes.keys())}) -- verifier la coherence avec digital_twin/pv_metadata.py."
             )
     return True
 

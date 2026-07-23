@@ -74,8 +74,8 @@ produces a step profile. See the conversion note in
 ## Regenerating the files
 
 ```{code-block} bash
-python -m sourcecode.consumption_bank   # bank + irradiance parquets
-python -m sourcecode.pv_metadata        # pv_installations.csv
+python -m digital_twin.consumption_bank   # bank + irradiance parquets
+python -m digital_twin.pv_metadata        # pv_installations.csv
 ```
 
 ```{note}

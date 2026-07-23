@@ -25,7 +25,7 @@ rest of this brick.
 `system_factor` (default 0.8) encapsulates, IN A SINGLE NUMBER, both the real
 system efficiency (inverter ~97%, wiring ~98%, soiling/mismatch ~95%, i.e. ~0.90
 combined) AND the fact that we use GLOBAL HORIZONTAL irradiance (GHI, tilt=0 --
-see sourcecode/consumption_bank.py) rather than plane-of-array irradiance (POA,
+see digital_twin/consumption_bank.py) rather than plane-of-array irradiance (POA,
 tilt ~30-35° typical in Belgium): a tilted panel collects relatively LESS at noon
 in summer than a horizontal surface (sun near zenith) -- an effect a plain
 constant factor cannot capture. Measured consequence: with system_factor=0.8,

@@ -17,7 +17,7 @@ status):
   when their street could not be matched to a metered EAN.
 - Finish migrating the network-reconstruction and simulation logic from
   [power_flow.ipynb](../power_flow.ipynb) into
-  [sourcecode/digital_twin.py](../sourcecode/digital_twin.py)
+  [digital_twin/digital_twin.py](../digital_twin/digital_twin.py)
   (`run_digital_twin`).
 - Wire `run_digital_twin` into `communication_agents.py` in the MAS4TE
   framework (see [Interfacing](interfacing.md)).

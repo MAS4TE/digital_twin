@@ -17,7 +17,7 @@ The bus -> street link must exist and be usable for the 333 residential buses:
     used for load-profile assignment, unrelated to the full physical topology.
   - 'street' column of consumption_bank_real_weeks.parquet: NOT usable either
     -- limited to the streets of the 33 measured EANs (same subset as above,
-    see sourcecode/consumption_bank.py).
+    see digital_twin/consumption_bank.py).
   - _build_network()['buses'] (digital_twin.py): USABLE and authoritative --
     dict (street, num) -> bus_id, covering exactly the 333 real residential
     buses across 7 real streets (Avenue Joseph Merlot 106, Rue Ernest Malvoz
@@ -38,7 +38,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-from sourcecode.digital_twin import _build_network, _config_to_dict
+from digital_twin.digital_twin import _build_network, _config_to_dict
 
 OUT_PATH = "data/pv_installations.csv"
 

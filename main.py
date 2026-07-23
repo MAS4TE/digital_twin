@@ -2,10 +2,10 @@ import os
 
 import pandas as pd
 
-from sourcecode.consumption_bank import generate_load_profiles
-from sourcecode.digital_twin import run_digital_twin
-from sourcecode.pv_metadata import generate_pv_metadata
-from sourcecode.pv_production import build_pv_production
+from digital_twin import run_digital_twin
+from digital_twin.consumption_bank import generate_load_profiles
+from digital_twin.pv_metadata import generate_pv_metadata
+from digital_twin.pv_production import build_pv_production
 
 DATA_PATH = "data/"
 
@@ -97,7 +97,8 @@ if __name__ == "__main__":
     print(results["Run 3 PV     (scale=1, PV=oui)"])
 
 """
-The function `run_digital_twin` is defined in digital_twin.py inside sourcecode folder.
+The function `run_digital_twin` is defined in digital_twin/digital_twin.py and re-exported
+from the `digital_twin` package (`from digital_twin import run_digital_twin`).
 The function is to be introduced in communication_agents.py within the MAS4TE framework.
 
 args: 

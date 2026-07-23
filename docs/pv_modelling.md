@@ -38,7 +38,7 @@ neighbourhood/installer effect that concentrates PV on a few feeders) rather
 than spread uniformly.
 
 ```{code-block} python
-from sourcecode.pv_metadata import generate_pv_metadata
+from digital_twin.pv_metadata import generate_pv_metadata
 
 pv = generate_pv_metadata(config={"n_installations": 30, "seed": 42})
 ```
@@ -64,7 +64,7 @@ park instead of drawing a fresh one — this preserves the original buses so the
 comparison isolates the effect of penetration:
 
 ```{code-block} python
-from sourcecode.pv_metadata import extend_pv_metadata
+from digital_twin.pv_metadata import extend_pv_metadata
 
 pv50 = extend_pv_metadata(pv, n_additional=20, out_path="data/pv_installations_50.csv")
 ```
@@ -80,7 +80,7 @@ the `kwp` from the metadata. The conversion model is deliberately simple for
 v1 and isolated in a single function so it can be swapped later:
 
 ```{code-block} python
-from sourcecode.pv_production import build_pv_production
+from digital_twin.pv_production import build_pv_production
 import pandas as pd
 
 pv_installations = pd.read_csv("data/pv_installations.csv")
@@ -133,7 +133,7 @@ voltage for load stress.
 
 ```{code-block} python
 import pandas as pd
-from sourcecode.digital_twin import run_digital_twin
+from digital_twin.digital_twin import run_digital_twin
 
 households = pd.read_csv("data/households.csv")
 load_profiles = pd.read_csv("data/load_profiles.csv", index_col=0)   # MW
@@ -158,11 +158,11 @@ signature and return format, and [Load assignment](load_assignment.md) for how
 Beyond a single run, a ready-made **multi-scenario** study compares several PV
 penetrations. It does **not** go through `run_digital_twin`; it uses a separate
 orchestration layer (`build_base_network` / `run_pv_scenario` in
-`sourcecode/pv_injection.py`) designed to build the network once and run many
+`digital_twin/pv_injection.py`) designed to build the network once and run many
 scenarios efficiently on deep copies.
 
 ```{code-block} python
-from sourcecode.pv_injection import build_base_network, run_pv_scenario
+from digital_twin.pv_injection import build_base_network, run_pv_scenario
 import pandas as pd
 
 households = pd.read_csv("data/households.csv")
@@ -201,8 +201,8 @@ the number of installations.
 The data files consumed above are produced by:
 
 ```{code-block} bash
-python -m sourcecode.consumption_bank   # bank + PVGIS irradiance parquets
-python -m sourcecode.pv_metadata        # data/pv_installations.csv
+python -m digital_twin.consumption_bank   # bank + PVGIS irradiance parquets
+python -m digital_twin.pv_metadata        # data/pv_installations.csv
 ```
 
 See [Data files](data_files.md) for the exact schema of each file.

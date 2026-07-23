@@ -79,7 +79,7 @@ weeks themselves. See [Load assignment](load_assignment.md) for the details.
 ## 6. Packaging as a digital twin function
 
 The steps above are consolidated into `run_digital_twin`
-(`sourcecode/digital_twin.py`), which takes its inputs (configuration,
+(`digital_twin/digital_twin.py`), which takes its inputs (configuration,
 households, load and PV profiles, battery schedules) as plain `pandas`
 DataFrames and returns a single DataFrame with the resulting summary verdict,
 violations and warnings — see [Interfacing](interfacing.md).

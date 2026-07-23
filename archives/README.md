@@ -15,5 +15,5 @@ mission est accomplie). Conservés pour référence, plus dans le flux courant.
   Ses sorties restent dans `outputs_integrate_B/`.
 
 - **power_flow.ipynb** — prototype d'origine du réseau / power flow, dont
-  `sourcecode/digital_twin.py` est la migration. Remplacé comme runtime ;
+  `digital_twin/digital_twin.py` est la migration. Remplacé comme runtime ;
   gardé comme référence historique.

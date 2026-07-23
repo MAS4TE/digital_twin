@@ -18,7 +18,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from sourcecode.pv_injection import (
+from digital_twin.pv_injection import (
     build_base_network, verify_bus_ids, run_pv_scenario,
     PV_INSTALLATIONS_PATH, IRRADIANCE_PATH,
 )

@@ -21,7 +21,7 @@ Materialises the bank of real weekly profiles as a parquet file. Run once; the
 result is reused by every simulation.
 
 ```{code-block} python
-from sourcecode.consumption_bank import build_consumption_bank
+from digital_twin.consumption_bank import build_consumption_bank
 
 bank = build_consumption_bank()   # writes data/consumption_bank_real_weeks.parquet
 ```
@@ -41,7 +41,7 @@ The upstream generator turns the bank into a ready-to-use `load_profiles.csv`.
 This is the function `main.py` calls before running the twin.
 
 ```{code-block} python
-from sourcecode.consumption_bank import generate_load_profiles
+from digital_twin.consumption_bank import generate_load_profiles
 
 generate_load_profiles(6, households, out_path="data/load_profiles.csv")  # June
 ```
@@ -110,7 +110,7 @@ for detailed PV self-consumption studies.
 ## Regenerating the bank and profiles
 
 ```{code-block} bash
-python -m sourcecode.consumption_bank   # bank + irradiance parquets
+python -m digital_twin.consumption_bank   # bank + irradiance parquets
 ```
 
 `main.py` then calls `generate_load_profiles` to produce `load_profiles.csv`

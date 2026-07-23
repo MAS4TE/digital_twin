@@ -13,7 +13,7 @@ pas de spines top/right). Sauvegarde PNG + PDF.
 À LANCER DANS pandapower_env (pandas + matplotlib déjà présents).
 
 Script de présentation, hors pipeline de production : ne modifie ni
-n'importe sourcecode/digital_twin.py, lit uniquement les fichiers de
+n'importe digital_twin/digital_twin.py, lit uniquement les fichiers de
 données déjà matérialisés.
 
 >>> Points de raccordement résolus (vérifiés contre le schéma réel) :
@@ -56,7 +56,7 @@ données déjà matérialisés.
        parfois le 2eme quasi plat ce jour precis). Pas de moyenne
        inter-semaines (ecraserait les pics).
     2. load_mv_day() -> data/mv_passage_profiles.csv
-       Localisé dans sourcecode/digital_twin.py (MV_PASSAGE_PROFILES_FILE,
+       Localisé dans digital_twin/digital_twin.py (MV_PASSAGE_PROFILES_FILE,
        MV_PASSAGE). C'est un fichier CSV dédié, séparé de la banque
        résidentielle : 672 lignes ('Mon 00:00'..'Sun 23:45'), colonnes =
        les 4 noms réels ('Paradis du Bouhay', 'Plantations', 'Omnisport

@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")  # backend sur (savefig fiable, cf. soucis machine recurrents)
 import matplotlib.pyplot as plt
 
-from sourcecode.pv_production import (
+from digital_twin.pv_production import (
     build_pv_production, STEPS_PER_DAY, PV_INSTALLATIONS_PATH, IRRADIANCE_PATH,
 )
 

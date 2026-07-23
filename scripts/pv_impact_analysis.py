@@ -7,7 +7,7 @@ refait la même comparaison (0/30/50, pas 80) sur un mois d'hiver comme
 contrôle de complétude (confirmer l'absence de surtension hivernale).
 
 S'appuie sur l'architecture réseau de base + deepcopy de la brique 3
-(`sourcecode.pv_injection.build_base_network` / `run_pv_scenario`).
+(`digital_twin.pv_injection.build_base_network` / `run_pv_scenario`).
 Le garde-fou d'alignement temporel (désormais
 `digital_twin._verify_temporal_alignment`, rapatrié avec l'injection PV) reste
 appelé à l'intérieur de `run_pv_scenario()` avant chaque power flow -- pas
@@ -27,8 +27,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sourcecode.pv_injection import build_base_network, run_pv_scenario, verify_bus_ids
-from sourcecode.pv_production import STEPS_PER_DAY
+from digital_twin.pv_injection import build_base_network, run_pv_scenario, verify_bus_ids
+from digital_twin.pv_production import STEPS_PER_DAY
 
 OUT_DIR = "outputs_pv_impact"
 V_LOW = 1.05   # seuil EN 50160 (usage courant)

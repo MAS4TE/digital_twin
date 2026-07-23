@@ -7,7 +7,7 @@ framework.
 ## The `run_digital_twin` function
 
 ```{code-block} python
-from sourcecode.digital_twin import run_digital_twin
+from digital_twin.digital_twin import run_digital_twin
 
 out = run_digital_twin(config, households, load_profiles, pv_profiles, schedules_BSS)
 ```
@@ -29,7 +29,7 @@ A minimal usage example is given in [main.py](../main.py), which loads the
 CSV inputs from a local `data/` folder and calls `run_digital_twin` directly.
 
 ```{note}
-`sourcecode/digital_twin.py` currently holds the function signature; the
+`digital_twin/digital_twin.py` currently holds the function signature; the
 implementation is being migrated from [power_flow.ipynb](../power_flow.ipynb)
 following the steps described in [Pipeline](pipeline.md).
 ```
@@ -56,6 +56,6 @@ flowchart LR
     B --> C[(pandapower network\nBressoux)]
 ```
 
-This keeps the digital twin logic self-contained in `sourcecode/`, with a
+This keeps the digital twin logic self-contained in `digital_twin/`, with a
 single, well-defined entry point (`run_digital_twin`) as the boundary between
 the network model and the rest of the MAS4TE agent framework.

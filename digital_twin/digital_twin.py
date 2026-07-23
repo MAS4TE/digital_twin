@@ -164,14 +164,14 @@ CABINE_STREET_SEGMENTS = [
 # ============================================================
 #  "Monthly bank" profile generation
 #  Bank of real EAN weeks (672 steps), segmented by month, materialized by
-#  sourcecode/consumption_bank.py.
+#  digital_twin/consumption_bank.py.
 #
 #  The generation logic below (_build_load_profiles_banque_mensuelle) is NOT
 #  called by run_digital_twin: it is consumed upstream, so that generation and
 #  execution stay separate. Consumers:
-#    - sourcecode/consumption_bank.generate_load_profiles -> writes
+#    - digital_twin/consumption_bank.generate_load_profiles -> writes
 #      data/load_profiles.csv, which run_digital_twin then reads as-is;
-#    - sourcecode/pv_injection.py -> builds its load profiles.
+#    - digital_twin/pv_injection.py -> builds its load profiles.
 #  It lives here (imported by both) rather than in a tool module, to keep the
 #  central file self-contained.
 # ============================================================
@@ -526,7 +526,7 @@ def _build_network(config):
 #  A single assignment function (_assign_loads): it consumes the `load_profiles`
 #  received by run_digital_twin (an interface contract), regardless of who
 #  produced it and how. That load_profiles is generated upstream, outside the
-#  twin, see sourcecode/consumption_bank.py.
+#  twin, see digital_twin/consumption_bank.py.
 # ============================================================
 def _assign_loads(net, buses, mv_nodes, households, load_profiles, config):
     """Assign a load profile to each LV charge bus, plus the fixed deterministic
@@ -653,7 +653,7 @@ def _load_consumption_bank(bank_path):
     if not os.path.exists(bank_path):
         raise FileNotFoundError(
             f"Banque de semaines reelles introuvable ({bank_path}). Executer "
-            "`python sourcecode/consumption_bank.py` pour la materialiser avant "
+            "`python digital_twin/consumption_bank.py` pour la materialiser avant "
             "de generer load_profiles via la banque mensuelle "
             "(consumption_bank.generate_load_profiles)."
         )
@@ -664,7 +664,7 @@ def _build_load_profiles_banque_mensuelle(households, config):
     """Fill a `load_profiles` in the load_profiles.csv format (index
     'Mon 00:00'..'Sun 23:45', columns profile_{id}, values in MW), but whose
     CONTENT comes from real EAN weeks of month `config['mois_simule']` (see
-    sourcecode/consumption_bank.py).
+    digital_twin/consumption_bank.py).
 
     For each profile_id in `households`, draw (with replacement, seed=
     config['seed']) one real week from the sub-bank of the SAME street (bank
@@ -684,7 +684,7 @@ def _build_load_profiles_banque_mensuelle(households, config):
     if 'street' not in bank.columns:
         raise ValueError(
             f"{config['bank_path']} ne contient pas de colonne 'street' -- "
-            "regenerer la banque avec `python sourcecode/consumption_bank.py` "
+            "regenerer la banque avec `python digital_twin/consumption_bank.py` "
             "(version a jour de consumption_bank.py, qui l'ajoute)."
         )
 
@@ -945,7 +945,7 @@ def run_digital_twin(config, households, load_profiles,
 
     # Generation / execution separation: run_digital_twin does not generate
     # profiles internally -- it RECEIVES `load_profiles` (produced upstream, see
-    # sourcecode/consumption_bank.generate_load_profiles) and uses it as-is.
+    # digital_twin/consumption_bank.generate_load_profiles) and uses it as-is.
     load_profiles_for_assignment = load_profiles
 
     # load_scale is a single stress-test channel: an EXECUTION parameter (not
@@ -1005,8 +1005,8 @@ def _config_to_dict(config):
         # mois_simule / bank_path: GENERATION parameters (monthly bank). The twin
         # does not read them itself; they are defaults for
         # _build_load_profiles_banque_mensuelle, called upstream by
-        # sourcecode/consumption_bank.generate_load_profiles (CSV generator) and
-        # by sourcecode/pv_injection.py.
+        # digital_twin/consumption_bank.generate_load_profiles (CSV generator) and
+        # by digital_twin/pv_injection.py.
         'mois_simule': 1,                     # target month of the bank at generation time
         'bank_path': 'data/' + CONSUMPTION_BANK_FILE,  # bank of real weeks -- see consumption_bank.py
         'export_aggregate_profile': False,    # opt-in 672-row profile_agg export

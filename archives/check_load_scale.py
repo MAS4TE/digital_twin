@@ -10,7 +10,7 @@ import time
 
 import pandas as pd
 
-from sourcecode.digital_twin import run_digital_twin
+from digital_twin.digital_twin import run_digital_twin
 
 DATA_PATH = "data/"
 households = pd.read_csv(DATA_PATH + "households.csv")

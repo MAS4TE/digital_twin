@@ -164,7 +164,7 @@ def generate_load_profiles(mois_simule, households=None, config=None,
     # consumption_bank; the import is kept close to its use).
     # _build_load_profiles_banque_mensuelle is the single source of the draw
     # logic (one shared implementation).
-    from sourcecode.digital_twin import (
+    from digital_twin.digital_twin import (
         _build_load_profiles_banque_mensuelle, _config_to_dict,
     )
 

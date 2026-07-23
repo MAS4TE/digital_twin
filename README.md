@@ -2,9 +2,23 @@
 
 Digital twin of the Bressoux neighbourhood distribution network, developed as
 part of the **MAS4TE** project. The core entry point is `run_digital_twin`
-(`sourcecode/digital_twin.py`), which takes households, load and PV profiles as
+(`digital_twin/digital_twin.py`), which takes households, load and PV profiles as
 `pandas` DataFrames and returns a network verdict (voltages, loadings,
 violations).
+
+## Using it as a dependency
+
+`digital_twin` is a standard Python package (`pyproject.toml`), so other
+projects — e.g. the MAS4TE multi-agent framework — can depend on it directly
+from this repository:
+
+```bash
+pip install "git+https://github.com/bcornelusse/MAS4TE_ULIEGE.git@package-version"
+```
+
+```python
+from digital_twin import run_digital_twin
+```
 
 ## Documentation
 
@@ -18,12 +32,24 @@ open docs/_build/html/index.html
 
 ## Set up
 
-1. Create or load a virtual environment for Python 3.14.
-2. Install the required packages:
+1. Create or load a virtual environment for Python 3.10+.
+2. Install the package (editable install, so edits to `digital_twin/` are
+   picked up without reinstalling):
 
    ```bash
-   pip install -r requirements.txt
+   pip install -e .
    ```
+
+   To also pull the Sphinx documentation dependencies:
+
+   ```bash
+   pip install -e ".[docs]"
+   ```
+
+   This installs `digital_twin` as an importable package (`import
+   digital_twin`) with pinned runtime dependencies, as declared in
+   `pyproject.toml`. `requirements.txt` is kept for reference/CI parity but
+   `pyproject.toml` is now the source of truth.
 
 3. Create a `data/` folder at the repository root (**you have to create it** —
    it is git-ignored to avoid polluting the repo with large data files).
@@ -51,7 +77,7 @@ Starting from the two source files above placed in `data/`, run these steps
    the PVGIS irradiance series):
 
    ```bash
-   python -m sourcecode.consumption_bank
+   python -m digital_twin.consumption_bank
    ```
 
    Writes `data/consumption_bank_real_weeks.parquet` and
@@ -69,7 +95,7 @@ Starting from the two source files above placed in `data/`, run these steps
 3. **PV installation register** (which buses carry PV, and their size):
 
    ```bash
-   python -m sourcecode.pv_metadata
+   python -m digital_twin.pv_metadata
    ```
 
    Writes `data/pv_installations.csv`.
@@ -87,7 +113,7 @@ runs; steps 1–3 are one-off (re-run them only if the sources change).
 
 ## Repository layout
 
-- `sourcecode/` — the digital twin (`digital_twin.py`) and the upstream
+- `digital_twin/` — the digital twin (`digital_twin.py`) and the upstream
   generators (`consumption_bank.py`, `pv_metadata.py`, `pv_production.py`) plus
   the multi-scenario PV tooling (`pv_injection.py`).
 - `main.py` — orchestration/demo: generate profiles, then run the twin.

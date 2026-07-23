@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "digital_twin"
+version = "0.1.0"
+description = "Digital twin of the Bressoux neighbourhood distribution network (MAS4TE project)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas==2.3.3",
+    "pandapower==3.4.0",
+    "plotly==6.6.0",
+    "matplotlib==3.10.8",
+    "scikit-learn==1.9.0",
+    "pyarrow",
+    "pvlib",
+]
+
+[project.optional-dependencies]
+docs = [
+    "sphinx",
+    "myst-parser",
+    "sphinx-rtd-theme",
+    "sphinxcontrib-mermaid",
+]
+
+[tool.setuptools.packages.find]
+include = ["digital_twin*"]
