@@ -340,9 +340,9 @@ def _validate_inputs(config, households, load_profiles,
 def _build_network(config):
     """Reconstruct the fixed Bressoux MV/LV network.
 
-    Loads the building coordinates (df_coords) and meter data (df_eans)
-    internally, extracts the MV passage nodes, creates the slack, MV buses,
-    transformers (one per substation), LV load buses, and all lines.
+    Loads the building coordinates (df_coords) internally, extracts the MV
+    passage nodes, creates the slack, MV buses, transformers (one per
+    substation), LV load buses, and all lines.
 
     Returns
     -------
@@ -354,15 +354,10 @@ def _build_network(config):
     data_path = config['data_path']
 
     # --- Load raw data ---
-    df_eans = pd.read_csv(
-        data_path + "part-00000-3895d355-7ed8-4cff-a072-bdc8805c8651-c000.csv",
-        dtype={13: str, 15: str},
-    )
+    # The raw meter CSV is NOT read here: the network topology derives entirely
+    # from df_coords. The EAN filter (total_cons >= 365) lives where it is
+    # actually consumed, in consumption_bank.build_consumption_bank.
     df_coords = pd.read_csv(data_path + "coordonnées.csv", sep='\t')
-
-    total_cons = df_eans.groupby('ean_anon')['measure_cons'].agg(lambda s: s.max() - s.min())
-    keep_eans = total_cons[total_cons >= 365].index
-    df_eans = df_eans[df_eans['ean_anon'].isin(keep_eans)].copy()
 
     # --- Housenumber / parity parsing ---
     df_coords["addr:housenumber"] = df_coords["addr:housenumber"].replace("", None)
