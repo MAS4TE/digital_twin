@@ -50,7 +50,9 @@ def build_base_network(config=None):
     values of these external dicts -- no need to copy or rebuild them per scenario).
     """
     net_cfg = _config_to_dict(config)
-    net_base, buses, mv_nodes, validation = _build_network(net_cfg)
+    # _build_network also returns its topology warnings; build_base_network
+    # keeps its 4-tuple contract (its callers are analysis scripts).
+    net_base, buses, mv_nodes, validation, _ = _build_network(net_cfg)
     return net_base, buses, mv_nodes, validation
 
 

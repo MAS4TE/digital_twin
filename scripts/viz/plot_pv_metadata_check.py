@@ -43,7 +43,7 @@ def _bus_coords_and_streets():
     reconstruit (pas une re-derivation independante depuis coordonnées.csv,
     pour garantir la coherence bus_id <-> position)."""
     cfg = _config_to_dict(None)
-    net, buses, mv_nodes, validation = _build_network(cfg)
+    net, buses, mv_nodes, validation, _ = _build_network(cfg)
 
     coords = {}
     for (street, num), b in buses.items():
