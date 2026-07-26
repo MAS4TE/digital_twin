@@ -1,54 +1,111 @@
 # Load assignment
 
 Consumption profiles reach the network in two decoupled stages. First, upstream
-of the twin, a `load_profiles.csv` is **generated** from a bank of real weeks.
-Then [`run_digital_twin`](interfacing.md) **receives** that `load_profiles` and
-its assignment step maps the profiles onto the load buses. The twin never
-generates profiles itself — it uses whatever `load_profiles` it is given, which
-in the MAS4TE setting is how **we** supply realistic profiles from the Bressoux
-smart-meter data (the agents may supply their own instead).
+of the twin, a scenario's `out/processed/load_profiles.csv` is **generated**
+from the real EAN smart-meter data. Then [`run_digital_twin`](interfacing.md)
+**receives** that timeseries as its `households` argument, and its assignment
+step maps the profiles onto the load buses. The twin never generates profiles
+itself — it uses whatever `households` it is given, which in the MAS4TE
+setting is how **we** supply realistic profiles from the Bressoux smart-meter
+data (the agents may supply their own instead).
 
 ```{note}
 The metered population is the project's target group of **social housing**
 tenants. Consumption levels are accordingly modest and presence patterns
-heterogeneous; the real weeks capture this faithfully, where generic
+heterogeneous; the real profiles capture this faithfully, where generic
 average-household profiles would not.
 ```
 
-## 1. Building the bank — `build_consumption_bank`
+There are **two** generation mechanisms, used for different purposes:
 
-Materialises the bank of real weekly profiles as a parquet file. Run once; the
-result is reused by every simulation.
+- **Real-profile bank** (`generate_household_profiles`) — the primary
+  mechanism, used by `bressoux_setup.ipynb` to produce `main.py`'s
+  `households`. Agnostic to how many real EAN profiles exist; season-blind.
+- **Monthly bank** (`build_consumption_bank` / `generate_load_profiles`) — an
+  alternative, month-conditioned mechanism used where seasonal consistency
+  with PV production matters (`pv.run_pv_scenario`,
+  `scripts/pv_impact_analysis.py`).
+
+## 1. Real-profile bank — `generate_household_profiles` (primary mechanism)
 
 ```{code-block} python
-from digital_twin.consumption_bank import build_consumption_bank
+from digital_twin.data_processing.profiles import generate_household_profiles
 
-bank = build_consumption_bank()   # writes data/consumption_bank_real_weeks.parquet
+households, metadata = generate_household_profiles(n_profiles=333, seed=42)
 ```
 
-`build_consumption_bank(data_path="data/", out_path="data/consumption_bank_real_weeks.parquet")`
+`generate_household_profiles(n_profiles, data_path="data/bressoux/", raw_file=..., seed=42)`
+first calls `extract_real_weekly_profiles`, which averages each retained EAN's
+readings (filtered on `total_cons >= 365` kWh) into ONE representative
+672-step weekly profile (kW), keyed by day-of-week/time-of-day — this is the
+33 real Bressoux profiles. It then generates `n_profiles` household profiles
+from them, **agnostic to how many real profiles are actually available**:
+
+- `n_profiles <= 33` (the real count) — draws **without** replacement, no
+  perturbation: there's already enough real diversity.
+- `n_profiles > 33` — draws **with** replacement, each draw shifted (±8 steps,
+  ±2h, `SHIFT_MAX_STEPS`) and scaled (lognormal, σ=0.2, `SCALE_SIGMA`) so
+  duplicated households don't look identical. This revives the historical
+  `profil_conso.ipynb` `make_profile` mechanism, generalized to the
+  agnostic case.
+
+Returns `(households, metadata)` — `households` is the timeseries (index
+`'Mon 00:00'..'Sun 23:45'`, columns `profile_{i}`, MW); `metadata` has one row
+per profile, with the full MAS4TE household schema (see
+[Data files](data_files.md#out-processed-metadata-csv)) defaulted to
+`False`/`0.0`/unknown, plus `source_street`/`source_ean_index` for
+traceability. `bressoux_setup.ipynb` writes both to
+`out/processed/{load_profiles,metadata}.csv`.
+
+```{warning}
+This mechanism is season-blind (each EAN's profile is averaged over its whole
+available history) and, in the `n_profiles > 33` branch, dilutes real peaks
+through shift/scale perturbation (see "Why real weeks" below for why that
+matters). It trades those for being trivially agnostic to how much real data
+exists — reasonable for a general-purpose baseline scenario. Where seasonal
+consistency with PV or undiluted peak fidelity matters more, use the monthly
+bank instead (section 2).
+```
+
+## 2. Monthly bank — `build_consumption_bank` / `generate_load_profiles` (alternative mechanism)
+
+### 2a. Building the bank — `build_consumption_bank`
+
+Materialises the bank of real weekly profiles as a parquet file. Run once; the
+result is reused by every simulation that uses this mechanism.
+
+```{code-block} python
+from digital_twin.data_processing.profiles import build_consumption_bank
+
+bank = build_consumption_bank()   # writes data/bressoux/out/processed/consumption_bank_real_weeks.parquet
+```
+
+`build_consumption_bank(data_path="data/bressoux/", out_path="data/bressoux/out/processed/consumption_bank_real_weeks.parquet")`
 extracts every complete calendar week (672 quarter-hourly steps, Monday→Sunday,
 no gaps) from the retained meters (filtered on `total_cons >= 365` kWh) and tags
 each week by EAN, month, season and street. See [Data files](data_files.md) for
 the output schema.
 
 The companion function `build_irradiance_reference(out_path=..., year=2023)`
-fetches the matching PVGIS irradiance series used by the PV bricks.
+fetches the matching PVGIS irradiance series used by the PV bricks (already
+called by `bressoux_setup.ipynb`, since irradiance is needed regardless of
+which load-generation mechanism is used).
 
-## 2. Generating `load_profiles` — `generate_load_profiles`
+### 2b. Generating `households` — `generate_load_profiles`
 
-The upstream generator turns the bank into a ready-to-use `load_profiles.csv`.
-This is the function `main.py` calls before running the twin.
+The upstream generator turns the bank into a ready-to-use
+`out/processed/load_profiles.csv`.
 
 ```{code-block} python
-from digital_twin.consumption_bank import generate_load_profiles
+from digital_twin.data_processing.profiles import generate_load_profiles
 
-generate_load_profiles(6, households, out_path="data/load_profiles.csv")  # June
+generate_load_profiles(6, metadata, data_path="data/bressoux/")  # June
 ```
 
-`generate_load_profiles(mois_simule, households=None, config=None, out_path=..., data_path=...)`
-writes `data/load_profiles.csv` (index `'Mon 00:00'..'Sun 23:45'`, columns
-`profile_{id}`, values in **MW**), which the twin then reads back.
+`generate_load_profiles(mois_simule, metadata=None, config=None, out_path=None, data_path=...)`
+writes `<data_path>/out/processed/load_profiles.csv` (index `'Mon 00:00'..'Sun 23:45'`,
+columns `profile_{id}`, values in **MW**), which `process_data` then reads back
+as `households`.
 
 For each `profile_id`, a real week is drawn (with replacement, reproducible via
 `seed`) from the sub-bank of the **same street** and of the month
@@ -67,8 +124,9 @@ years differ.
 
 ## 3. Assigning profiles to buses (inside the twin)
 
-Once `run_digital_twin` receives `load_profiles`, a **light street-based
-association** maps a profile to each load bus: a bus on a street that has meters
+Once `run_digital_twin` receives `households`, a **light street-based
+association** maps a profile to each load bus (using `metadata`'s
+`source_street`/`profile_id` columns): a bus on a street that has meters
 receives a profile drawn at random among that street's profiles; a bus on a
 street without meters (orphan) receives a profile from the whole set and is
 flagged as a warning.
@@ -79,14 +137,17 @@ flagged as a warning.
 - Profiles are at a fixed **15-minute** step (672 steps per week) in MW/MVAr,
   matching pandapower's units. Near-zero loads are clipped to a small positive
   value to avoid power-flow convergence issues.
-- The stress multiplier `config['load_scale']` is applied to the received
-  `load_profiles` before assignment, so it scales the actual simulated loads.
 
-## Why real weeks
+There is no runtime load-scaling knob: a different scenario (e.g. a 3x-load
+stress test) is a different `data/bressoux/<scenario>/` folder with its own
+generated `households`, produced via the setup notebook, not a multiplier
+applied at execution time.
 
-The bank replaces an earlier method based on weekday/time-of-day **averaged**
-profiles perturbed by a random time shift and lognormal scaling. Two problems
-motivated the change:
+## Why real weeks (monthly bank rationale)
+
+The monthly bank (section 2) replaces an earlier method based on
+weekday/time-of-day **averaged** profiles perturbed by a random time shift and
+lognormal scaling. Two problems motivated the change:
 
 - the averaged method was **season-blind** — it produced identical profiles
   regardless of the simulated month;
@@ -107,11 +168,14 @@ same calendar weeks). This becomes relevant when off-peak dynamics matter, e.g.
 for detailed PV self-consumption studies.
 ```
 
-## Regenerating the bank and profiles
+## Regenerating the profiles
 
 ```{code-block} bash
-python -m digital_twin.consumption_bank   # bank + irradiance parquets
+jupyter execute data/bressoux/bressoux_setup.ipynb   # primary mechanism: metadata.csv,
+                                                       # load_profiles.csv, mv_load_profiles.csv
+python -m digital_twin.data_processing.profiles       # alternative: bank + irradiance parquets
 ```
 
-`main.py` then calls `generate_load_profiles` to produce `load_profiles.csv`
-for the chosen month before running the twin.
+`generate_load_profiles` (section 2b) is then called to produce a scenario's
+`out/processed/load_profiles.csv` for the chosen month, if using the monthly
+bank mechanism instead of the notebook's primary one.

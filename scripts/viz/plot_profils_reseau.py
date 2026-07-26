@@ -17,7 +17,7 @@ n'importe digital_twin/digital_twin.py, lit uniquement les fichiers de
 données déjà matérialisés.
 
 >>> Points de raccordement résolus (vérifiés contre le schéma réel) :
-    1. load_habitation_day() -> data/consumption_bank_real_weeks.parquet
+    1. load_habitation_day() -> data/bressoux/out/processed/consumption_bank_real_weeks.parquet
        Schéma réel : colonnes meta (ean_idx, ean_anon, street, month [int
        1-12], season, week_start) + 672 colonnes t0000..t0671 (PAS
        step_0..step_671, pas de colonne 'values'). Valeurs en MW (comme
@@ -55,9 +55,11 @@ données déjà matérialisés.
        visible ce jour-la (maximiser seulement le pic du 1er idx laissait
        parfois le 2eme quasi plat ce jour precis). Pas de moyenne
        inter-semaines (ecraserait les pics).
-    2. load_mv_day() -> data/mv_passage_profiles.csv
-       Localisé dans digital_twin/digital_twin.py (MV_PASSAGE_PROFILES_FILE,
-       MV_PASSAGE). C'est un fichier CSV dédié, séparé de la banque
+    2. load_mv_day() -> data/bressoux/out/processed/mv_load_profiles.csv
+       Nom de fichier defini dans digital_twin/digital_twin.py
+       (MV_LOAD_PROFILES_FILE), noms de facilities dans
+       data/bressoux/inputs/network.py (MV_LOADS). C'est un fichier CSV
+       dédié, séparé de la banque
        résidentielle : 672 lignes ('Mon 00:00'..'Sun 23:45'), colonnes =
        les 4 noms réels ('Paradis du Bouhay', 'Plantations', 'Omnisport
        BX', 'Groupe Scolaire'), un SEUL profil hebdomadaire fixe (pas de
@@ -93,8 +95,8 @@ DT_H = 0.25
 MW_TO_KW = 1000.0
 
 # --- Paramètres -----------------------------------------------------------
-BANK_PATH = "data/consumption_bank_real_weeks.parquet"
-MV_PROFILES_PATH = "data/mv_passage_profiles.csv"
+BANK_PATH = "data/bressoux/out/processed/consumption_bank_real_weeks.parquet"
+MV_PROFILES_PATH = "data/bressoux/out/processed/mv_load_profiles.csv"
 MOIS = "juin"                 # mois d'affichage (n'affecte pas la selection
                                # des habitations, qui se base sur l'annee
                                # entiere -- cf. _select_percentile_households)
@@ -108,9 +110,9 @@ PEAK_TO_MEAN_MAX = 15.0       # exclut les menages dont le ratio pic/moyenne
 HOUSEHOLD_PERCENTILES = (25, 50, 75)  # bas / median / haut
 
 MV_NAMES = ["Paradis du Bouhay", "Plantations", "Omnisport BX", "Groupe Scolaire"]
-# noms reels des colonnes de data/mv_passage_profiles.csv (cf.
-# digital_twin.MV_PASSAGE) ; correspondent respectivement a maison de
-# repos, centre horticole, hall omnisport, ecole.
+# noms reels des colonnes de data/bressoux/out/processed/mv_load_profiles.csv
+# (cf. data/bressoux/inputs/network.py, MV_LOADS) ; correspondent
+# respectivement a maison de repos, centre horticole, hall omnisport, ecole.
 MV_LABELS = {
     "Paradis du Bouhay": "Paradis du Bouhay (rest home)",
     "Plantations": "Plantations (horticultural center)",
@@ -270,7 +272,7 @@ def load_mv_day(mv_name, mois):
     jour de la semaine que le panneau habitations (pour une "journee type"
     coherente entre les deux panneaux).
 
-    Les 4 profils MV sont un fichier dedie (data/mv_passage_profiles.csv),
+    Les 4 profils MV sont un fichier dedie (data/bressoux/out/processed/mv_load_profiles.csv),
     un seul profil hebdomadaire fixe (pas de segmentation par mois) : le
     parametre `mois` ne sert qu'a determiner, via HAB_IDX, quel jour de la
     semaine aligner sur le panneau habitations.

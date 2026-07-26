@@ -6,6 +6,7 @@ matplotlib==3.10.8
 scikit-learn==1.9.0
 pyarrow
 pvlib
+folium
 
 # Documentation (Sphinx, built from docs/)
 sphinx

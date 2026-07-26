@@ -16,6 +16,7 @@ dependencies = [
     "scikit-learn==1.9.0",
     "pyarrow",
     "pvlib",
+    "folium",
 ]
 
 [project.optional-dependencies]

@@ -1,12 +1,5 @@
-/data
-/outputs*
 .DS_Store
 /docs/_build
 __pycache__/
-*.pyc
-*.egg-info/
-/build
-/dist
-scripts/viz/*.pdf
-scripts/viz/*.png
-NEXT_STEPS.md
+data/bressoux/inputs/
+data/bressoux/out/
