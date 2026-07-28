@@ -146,7 +146,7 @@ from digital_twin import run_digital_twin
 from digital_twin.data_processing.process_data import process_data
 
 config = {"data_path": "data/bressoux/"}
-metadata, network, households, pv_profiles = process_data(config)
+metadata, network, households, pv_profiles, schedules_BSS = process_data(config)
 
 out = run_digital_twin(config, metadata, network, households, pv_profiles=pv_profiles)
 ```

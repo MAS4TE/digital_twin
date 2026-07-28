@@ -10,8 +10,8 @@ config = {
                                                      # (inputs/network.py, inputs/pv_installations.csv, out/processed/metadata.csv, etc.)
         'simulated_week': 6 * 4,                    # target week of the bank at generation time
         'n_timesteps': 7 * 24 * 4,                  # number of timesteps in the simulation (7*24*4 for a week of 15-min intervals)
-        'v_min': 0.95,                              # minimum voltage threshold (per unit)
-        'v_max': 1.05,                              # maximum voltage threshold (per unit)
+        'v_min': 0.90,                              # minimum voltage threshold (per unit)
+        'v_max': 1.1,                              # maximum voltage threshold (per unit)
         'loading_max': 90.0,                        # maximum loading threshold (percent)
         'cos_phi': 0.95,                            # power factor (cosine of the phase angle)
         'trafo_sn_mva': 0.22,                       # transformer nominal power (MVA)
@@ -25,11 +25,12 @@ if __name__ == "__main__":
 
     # Load the data files from the specified path
     print(f"Loading data from {config['data_path']}...")
-    metadata, network, households, pv_profiles = process_data(config)
+    metadata, network, households, pv_profiles, schedules_BSS = process_data(config)
 
     # Simulating the digital twin for the specified month
     print(f"Simulating digital twin ...")
-    out = run_digital_twin(config, metadata, network, households, pv_profiles=pv_profiles)
+    out = run_digital_twin(config, metadata, network, households,
+                           pv_profiles=pv_profiles, schedules_BSS=schedules_BSS)
 
     if config['save']:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -54,9 +55,12 @@ args:
     - pv_profiles: a pandas DataFrame containing PV production profiles, built by
       process_data from inputs/pv_installations.csv (if the scenario has one) --
       None when the scenario has no PV.
-
-Note: `schedules_BSS` (battery schedules) is also accepted by run_digital_twin
-as an optional keyword argument, not wired up in this minimal demo.
+    - schedules_BSS: a pandas DataFrame containing the central battery park
+      schedule, built by process_data from inputs/bss_shares.csv (if the scenario
+      has one) -- None when the scenario has no BSS. Values in kW (the only kW
+      interface here, households and pv_profiles are in MW), positive = charging.
+      When provided it is injected as one storage element on config['bss_bus'],
+      driven per timestep, with the state of charge tracked and reported.
 
 Returns:
     - out: a pandas DataFrame containing the timeseries and warnings of the digital twin simulation.

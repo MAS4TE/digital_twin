@@ -15,6 +15,10 @@ A scenario folder (`config['data_path']`) is split in two:
                                      (bus_id, kwp, type, street, see
                                      pv.generate_pv_metadata). A scenario opts
                                      into PV simply by having this file.
+        - bss_shares.csv           : OPTIONAL -- BSS contractual share register
+                                     (bus_id, e_kwh, street, see
+                                     bss.generate_bss_shares). A scenario opts
+                                     into BSS simply by having this file.
     <data_path>/out/processed/ : DERIVED data, regenerated from inputs/ by the
                                 site's data pipeline (e.g. bressoux_setup.ipynb,
                                 digital_twin.data_processing.profiles/.pv):
@@ -35,12 +39,13 @@ import os
 import pandas as pd
 
 from ..utils import _config_to_dict, load_site_network
+from .bss import load_bss_schedule
 from .pv import build_pv_production
 
 
 def process_data(config):
-    """Load a scenario's network, household metadata, consumption profiles and
-    (if the scenario has any) PV production profiles.
+    """Load a scenario's network, household metadata, consumption profiles and,
+    if the scenario has them, PV production profiles and the BSS schedule.
 
     Parameters
     ----------
@@ -48,9 +53,20 @@ def process_data(config):
 
     Returns
     -------
-    (metadata, network, households, pv_profiles) : as expected by
+    (metadata, network, households, pv_profiles, schedules_BSS) : as expected by
     digital_twin.run_digital_twin(config, metadata, network, households,
-    pv_profiles=pv_profiles, ...)
+    pv_profiles=pv_profiles, schedules_BSS=schedules_BSS)
+
+        metadata      : pd.DataFrame          -- per-household attributes
+        network       : dict                  -- network bundle (net, buses, mv_nodes, ...)
+        households    : pd.DataFrame          -- consumption timeseries, MW
+        pv_profiles   : pd.DataFrame or None  -- PV production, MW; None when the
+                                                 scenario has no pv_installations.csv
+        schedules_BSS : pd.DataFrame or None  -- BSS park schedule, kW; None when the
+                                                 scenario has no bss_shares.csv
+
+    The two optional layers follow the SAME opt-in rule: a scenario enables them
+    by having the corresponding file in inputs/, and gets None here otherwise.
     """
     cfg = _config_to_dict(config)
     data_path = cfg['data_path'].rstrip('/')
@@ -61,8 +77,16 @@ def process_data(config):
     metadata = pd.read_csv(f"{processed_dir}/metadata.csv")
     households = pd.read_csv(f"{processed_dir}/load_profiles.csv", index_col=0)
     pv_profiles = _load_pv_profiles(cfg, inputs_dir, processed_dir)
+    # Built from households and pv_profiles, so it must come after both.
+    schedules_BSS = load_bss_schedule(households, pv_profiles, cfg, inputs_dir)
 
-    return metadata, network, households, pv_profiles
+    # POSITIONAL CONTRACT -- callers unpack this tuple by position, so the order
+    # below IS the interface. Any new element goes at the END, never in the
+    # middle: inserting one re-binds every position after it, and since four of
+    # the five are DataFrames a wrong binding does not raise at unpack time --
+    # it surfaces much later, as a confusing error deep inside the twin.
+    #   0 metadata | 1 network | 2 households | 3 pv_profiles | 4 schedules_BSS
+    return metadata, network, households, pv_profiles, schedules_BSS
 
 
 def _load_pv_profiles(cfg, inputs_dir, processed_dir):

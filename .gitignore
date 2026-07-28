@@ -3,3 +3,6 @@
 __pycache__/
 data/bressoux/inputs/
 data/bressoux/out/
+__MACOSX/
+scripts/viz/*.pdf
+scripts/viz/*.png

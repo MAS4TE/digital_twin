@@ -15,10 +15,20 @@ Pipeline (see docs/pipeline.md):
     4. Results evaluation (verdicts)
     5. Output formatting
 
-Scope: LOADS + PV. `pv_profiles` is a native capability (sgen injection, see
-_inject_pv_sgens / _run_powerflow): when provided, the power flow runs loads and
-PV together; when None, loads-only. `schedules_BSS` is accepted in the signature
-(MAS4TE contract) but not implemented yet -> ignored with a warning.
+Scope: LOADS + PV + BSS. Both optional layers are activated BY PRESENCE of their
+argument -- no enable flag for either:
+  * `pv_profiles`   -> sgen injection (_inject_pv_sgens).
+  * `schedules_BSS` -> storage injection (_read_bss_schedule ->
+    _inject_bss_storage -> _track_bss_soc): the columns are summed into one park
+    power series driving ONE storage element on an MV node (config['bss_bus']).
+
+Two OPPOSITE sign conventions live in this file:
+  * sgen (PV):     positive p_mw = INJECTION.
+  * storage (BSS): positive p_mw = CHARGING (consumption), negative = discharge.
+The BSS schedule follows the storage one; _inject_bss_storage documents it for
+the whole BSS path.
+
+Units: schedules_BSS is in kW, households/pv_profiles in MW.
 
 `network` is a caller-supplied input (see digital_twin.utils.load_site_network
 and e.g. data/bressoux/inputs/network.py for how a site builds one), NOT
@@ -39,7 +49,7 @@ import pandapower as pp
 from pandapower.control import ConstControl
 from pandapower.timeseries import DFData, OutputWriter, run_timeseries
 
-from .utils import _config_to_dict
+from .utils import STEPS_PER_DAY, _config_to_dict
 
 # ============================================================
 #  1. DATA INGESTION / INPUT VALIDATION
@@ -116,10 +126,41 @@ def _validate_inputs(config, metadata, households, pv_profiles, schedules_BSS):
                 f"config['n_timesteps'] ({config['n_timesteps']}) depasse le nombre de pas "
                 f"disponibles dans `pv_profiles` ({len(pv_profiles)})."
             )
-
-    # --- schedules_BSS: not supported yet ---
+        
+    # --- schedules_BSS (optional) ---
+    # One or more NUMERIC power columns, kW. Summed into one park aggregate by
+    # _read_bss_schedule, so column names carry no meaning (unlike pv_profiles'
+    # 'pv_{bus_id}'). Coverage only here; dtype and alignment live there.
+    #
+    # Malformed (non-numeric, or too short for n_timesteps) -> ValueError, as for
+    # pv_profiles. Infeasible -> warning downstream, power as [BSS/schedule] and
+    # energy as [BSS/soc]; both are clipped only when config['bss_enforce_limits']
+    # is set, otherwise applied as-is.
+    
     if schedules_BSS is not None and len(schedules_BSS) > 0:
-        warnings.append("`schedules_BSS` was provided but is not yet supported (loads + PV only) -- ignored.")
+        if schedules_BSS.shape[1] == 0:
+            raise ValueError(
+                "`schedules_BSS` has no column: at least one power column (kW) is required."
+            )
+        if config['n_timesteps'] > len(schedules_BSS):
+            raise ValueError(
+                f"config['n_timesteps'] ({config['n_timesteps']}) exceeds the number of "
+                f"timesteps available in `schedules_BSS` ({len(schedules_BSS)})."
+            )
+        # Park specs are only load-bearing once a schedule is actually injected,
+        # so they are validated here rather than in the unconditional block above.
+        if config['bss_park_e_kwh'] <= 0:
+            raise ValueError(
+                f"config['bss_park_e_kwh'] ({config['bss_park_e_kwh']}) must be positive."
+            )
+        if config['bss_park_p_kw'] <= 0:
+            raise ValueError(
+                f"config['bss_park_p_kw'] ({config['bss_park_p_kw']}) must be positive."
+            )
+        if not (0 < config['bss_eta'] <= 1):
+            raise ValueError(
+                f"config['bss_eta'] ({config['bss_eta']}) must be in (0, 1]."
+            )
 
     return warnings
 
@@ -233,27 +274,321 @@ def _inject_pv_sgens(net, pv_profiles):
     return sgen_bus
 
 
-def _verify_temporal_alignment(df_load_p, df_pv_p):
-    """Guardrail: loads and PV must share the SAME index (same length, same
-    labels, same order). Step-by-step mapping in the power flow is only correct
-    if they do. Raise a clear error rather than let a silent offset skew the net
-    production/consumption balance."""
-    if len(df_load_p) != len(df_pv_p):
+def _verify_temporal_alignment(df_load_p, df_other_p, label='PV'):
+    """Guardrail: loads and `df_other_p` (PV production, BSS schedule, ...) must
+    share the SAME index (same length, same labels, same order). Step-by-step
+    mapping in the power flow is only correct if they do. Raise a clear error
+    rather than let a silent offset skew the net production/consumption balance.
+
+    `label` names the other side in the error messages ('PV' by default, so
+    existing callers read unchanged).
+
+    KNOWN LIMITATION: every caller flattens both frames onto a RangeIndex before
+    calling, because DFData/ConstControl index BY POSITION. That makes the label
+    comparison below vacuous (two RangeIndex of equal length are always equal),
+    so in practice only the LENGTH is verified and a same-length temporal offset
+    passes unnoticed. Tolerable for PV and loads, both built from
+    _WEEK_TIME_INDEX by this repo; NOT self-evident for an externally produced
+    BSS schedule -- see the label-level pre-check in _read_bss_schedule.
+    """
+    if len(df_load_p) != len(df_other_p):
         raise ValueError(
-            f"Different lengths: load={len(df_load_p)} steps, PV={len(df_pv_p)} steps."
+            f"Different lengths: load={len(df_load_p)} steps, {label}={len(df_other_p)} steps."
         )
-    if list(df_load_p.index) != list(df_pv_p.index):
+    if list(df_load_p.index) != list(df_other_p.index):
         raise ValueError(
-            "Different index between load and PV production profiles -- "
+            f"Different index between load and {label} profiles -- "
             "step-by-step alignment is no longer mechanically guaranteed."
         )
     return True
 
 
 # ============================================================
+#  2ter. BSS SCHEDULE READING (reduction to the park aggregate)
+#
+#  Units: schedules_BSS arrives in kW -- the ONLY kW interface of
+#  run_digital_twin -- and is converted to MW at _BSS_KW_TO_MW below and nowhere
+#  else. pv_profiles is already MW at its interface (the /1000 happens upstream
+#  in process_data), so the two are NOT symmetric.
+# ============================================================
+_BSS_KW_TO_MW = 1e-3
+
+BSS_STORAGE_NAME = "BSS_central"   # storage element name == aggregate column name
+BSS_SOC_MIN_FRAC = 0.1             # min_e_mwh = 10% of max_e_mwh (reserve)
+BSS_SOC_INIT = 0.5                 # SoC at step 0; also the created soc_percent
+
+
+def _read_bss_schedule(schedules_BSS, df_load_p, config, load_time_index=None):
+    """Reduce a BSS schedule to the ONE-COLUMN frame the storage ConstControl reads.
+
+    Any number of numeric columns is summed column-wise -- one per battery, agent
+    or park sub-unit; the engine only needs the aggregate. A single pre-aggregated
+    column is the degenerate case of that sum, so nothing branches on column count.
+
+    Sign: positive = charging, negative = discharge (see _inject_bss_storage), so
+    the power check below is on |p|, symmetric in both directions.
+
+    The output column is named BSS_STORAGE_NAME so _run_powerflow's
+    profile_name <-> element name matching works as it does for 'pv_{bus_id}'
+    sgens -- that naming is why this returns a DataFrame rather than a Series.
+
+    Warning prefixes, one meaning each:
+      [BSS/read]     -- what was read (column count, missing values)
+      [BSS/align]    -- labelled index differs from the loads'
+      [BSS/schedule] -- instantaneous POWER over config['bss_park_p_kw']
+    The last one is not redundant with [BSS/soc] (cumulative energy, raised in
+    _track_bss_soc): both usually fire on the same file, for different causes.
+
+    Parameters
+    ----------
+    schedules_BSS : pd.DataFrame  # >=1 numeric power column, kW at the interface
+    df_load_p : pd.DataFrame      # load frame to align against (RangeIndex)
+    config : dict                 # bss_park_p_kw, n_timesteps, bss_enforce_limits
+    load_time_index : optional    # loads' labelled index (households.index),
+                                   # for the offset pre-check
+    Returns
+    -------
+    df_bss_p : pd.DataFrame  # single column BSS_STORAGE_NAME, MW, RangeIndex
+    n_cols : int             # columns summed into the aggregate
+    warnings : list[str]     # '[BSS/read]', '[BSS/align]', '[BSS/schedule]'
+    """
+    warnings = []
+
+    non_numeric = [c for c in schedules_BSS.columns
+                   if not pd.api.types.is_numeric_dtype(schedules_BSS[c])]
+    if non_numeric:
+        # Not coerced to NaN: a schedule silently read as zero would look like a
+        # park that simply never operates.
+        raise ValueError(
+            f"`schedules_BSS` has non-numeric column(s): {non_numeric[:10]}"
+            f"{' ...' if len(non_numeric) > 10 else ''}. Expected one numeric power "
+            "column per battery/agent/park sub-unit, in kW."
+        )
+
+    # Surfaced unconditionally, so the caller can tell at a glance whether the
+    # file received is the file expected (33 batteries vs 1 park profile).
+    n_cols = int(schedules_BSS.shape[1])
+    warnings.append(
+        f"[BSS/read] {n_cols} schedule column(s) read over {len(schedules_BSS)} "
+        f"timesteps, summed into a single park aggregate (kW at the interface). "
+        "Check this column count matches the expected number of batteries/agents."
+    )
+
+    n_nan = int(schedules_BSS.isna().sum().sum())
+    if n_nan:
+        warnings.append(
+            f"[BSS/read] {n_nan} missing value(s) in the schedule -- counted as 0 kW "
+            "by the column-wise sum, which understates the park power at those steps."
+        )
+
+    # TEMPORAL ALIGNMENT: warn, never reject. Three cases:
+    #   1. labelled index == load index      -> aligned, nothing to say.
+    #   2. labelled index != load index      -> [BSS/align] below.
+    #   3. bare RangeIndex                   -> accepted silently: it carries no
+    #      time information, so there is nothing to compare against. Guaranteeing
+    #      row k is the same instant on both sides is then the PROVIDER's job.
+    # Case 3 combined with a shifted schedule is undetectable by construction --
+    # the irreducible hole, listed in docs/interfacing.md ("Known limitations").
+    # It matters because the aggregate is injected as SIGNED power: an offset
+    # flips charge against discharge instead of degrading gracefully.
+    #
+    # Runs BEFORE the RangeIndex flattening below, which erases the evidence
+    # (_verify_temporal_alignment then only sees lengths). Worth doing because a
+    # BSS schedule is produced outside this repo, unlike households/pv_profiles.
+    if load_time_index is not None and not isinstance(schedules_BSS.index, pd.RangeIndex):
+        sched_labels, load_labels = list(schedules_BSS.index), list(load_time_index)
+        if len(sched_labels) == len(load_labels) and sched_labels != load_labels:
+            warnings.append(
+                f"[BSS/align] the schedule's own time index differs from the load index "
+                f"(schedule {sched_labels[0]!r}..{sched_labels[-1]!r}, loads "
+                f"{load_labels[0]!r}..{load_labels[-1]!r}) -- same length, so the "
+                "positional guardrail cannot catch it. Verify the schedule is not "
+                "time-shifted before its values are injected."
+            )
+
+    # Same discipline as the PV path: df_load_p lost its text index to .values in
+    # _assign_loads, so flatten onto the same RangeIndex before the guardrail.
+    sched = schedules_BSS.reset_index(drop=True)
+    _verify_temporal_alignment(df_load_p, sched, label='BSS schedule')
+
+    total_kw = sched.sum(axis=1).to_numpy(dtype=float)
+
+    # --- [BSS/schedule]: instantaneous power feasibility ---
+    # Simulated horizon only, like _track_bss_soc: steps the power flow never runs
+    # must not raise feasibility warnings. Compared in kW against the config value
+    # itself, so the threshold printed is the threshold applied. |p| because the
+    # rating is symmetric in charge and discharge.
+    horizon = min(int(config['n_timesteps']), len(total_kw))
+    p_max_kw = float(config['bss_park_p_kw'])
+    enforce = bool(config['bss_enforce_limits'])
+    window = total_kw[:horizon]
+    n_over = int((np.abs(window) > p_max_kw + 1e-9).sum())
+    if n_over:
+        k = int(np.argmax(np.abs(window)))
+        warnings.append(
+            f"[BSS/schedule] scheduled power exceeds config['bss_park_p_kw'] "
+            f"({p_max_kw:.1f} kW) at {n_over} of {horizon} step(s) -- worst at step "
+            f"{k} ({window[k]:+.1f} kW)"
+            + (" -- clipped (bss_enforce_limits=True)." if enforce
+               else " -- applied as-is (bss_enforce_limits=False).")
+        )
+    if enforce:
+        # Clip only the simulated horizon; the tail is carried through untouched
+        # so the frame keeps the FULL length the alignment guardrail compared.
+        total_kw[:horizon] = np.clip(window, -p_max_kw, p_max_kw)
+
+    # THE kW -> MW conversion point (see the unit convention above).
+    df_bss_p = pd.DataFrame({BSS_STORAGE_NAME: total_kw * _BSS_KW_TO_MW})
+    return df_bss_p, n_cols, warnings
+
+
+# ============================================================
+#  2quater. BSS INJECTION (centralised battery park, native capability)
+#  Same split as the PV layer above: the element is created here, its
+#  per-timestep power is applied by a ConstControl in _run_powerflow.
+# ============================================================
+def _inject_bss_storage(net, config, mv_nodes):
+    """Create the single centralised BSS storage element on `net`.
+
+    SIGN CONVENTION for the whole BSS path -- everything else refers back here.
+    pandapower storage: p_mw POSITIVE = CHARGE (a consumer seen from the grid),
+    NEGATIVE = discharge. Verified on pandapower 3.4.0: a storage at p_mw=+0.1
+    drives res_ext_grid.p_mw to +0.1, i.e. the network imports. This is the
+    OPPOSITE of the sgen convention in _inject_pv_sgens just above, and the
+    schedule follows the STORAGE one.
+
+    p_mw=0 at creation (ConstControl fills it per timestep in _run_powerflow),
+    q_mvar left at 0 for the whole run (pure active power, as for the PV sgens).
+    net.storage is emptied first so storages never accumulate across calls.
+
+    PLACEMENT on an MV node, resolved through the bundle's `mv_nodes` (9 buses on
+    Bressoux). An LV secondary bus is out of scope: build_network keeps
+    `cabine_lv_bus` local, so config has no stable handle to name one.
+    config['bss_bus'] accepts an MV node NAME or an integer bus id.
+
+    Returns
+    -------
+    storage_bus : dict {index in net.storage -> bus_id}
+    """
+    net.storage = net.storage.iloc[0:0]
+
+    bss_bus = config['bss_bus']
+    valid = {name: int(b) for name, b in mv_nodes.items()}
+    if isinstance(bss_bus, str):
+        if bss_bus not in valid:
+            raise ValueError(
+                f"config['bss_bus'] = {bss_bus!r} is not an MV node of this network. "
+                f"Valid names: {sorted(valid)}."
+            )
+        bus_id = valid[bss_bus]
+    else:
+        try:
+            bus_id = int(bss_bus)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"config['bss_bus'] = {bss_bus!r} is neither an MV node name nor an "
+                f"integer bus id. Valid names: {sorted(valid)}."
+            )
+        if bus_id not in set(valid.values()):
+            raise ValueError(
+                f"config['bss_bus'] = {bus_id} is not an MV bus of this network "
+                f"(MV bus ids: {sorted(valid.values())}). Valid names: {sorted(valid)}."
+            )
+
+    max_e_mwh = float(config['bss_park_e_kwh']) / 1000.0
+    max_p_mw = float(config['bss_park_p_kw']) / 1000.0
+    idx = pp.create_storage(
+        net, bus=bus_id, p_mw=0.0,
+        max_e_mwh=max_e_mwh, min_e_mwh=BSS_SOC_MIN_FRAC * max_e_mwh,
+        max_p_mw=max_p_mw, min_p_mw=-max_p_mw, sn_mva=max_p_mw,
+        soc_percent=100.0 * BSS_SOC_INIT, name=BSS_STORAGE_NAME,
+    )
+    return {idx: bus_id}
+
+
+def _track_bss_soc(p_mw, config, soc_init=BSS_SOC_INIT):
+    """Integrate the aggregate schedule into a state of charge, step by step.
+
+    pandapower does not update soc_percent during a time-series run -- ConstControl
+    only writes p_mw -- so the SoC is tracked here by hand. It is the only way to
+    tell whether a schedule is feasible for a park of config['bss_park_e_kwh'].
+
+    Integrated from the SCHEDULED series rather than res_storage.p_mw, because
+    ConstControl applies the scheduled value exactly. That equivalence holds only
+    while the storage is NON-CURTAILABLE: add any controller that can override
+    p_mw (voltage-driven curtailment, an OPF step) and this must switch to reading
+    res_storage.p_mw back out of the OutputWriter.
+
+    Step duration is derived from STEPS_PER_DAY, never hard-coded, so a change of
+    time resolution propagates here.
+
+    Sign as in _inject_bss_storage: p_mw > 0 charges, < 0 discharges.
+    config['bss_eta'] is the ONE-WAY efficiency -- charging stores p*dt*eta,
+    discharging draws p*dt/eta -- so a full cycle costs eta**2.
+
+    With config['bss_enforce_limits'] the per-step power is clipped to keep the
+    stored energy inside [min_e_mwh, max_e_mwh]; without it the schedule runs
+    untouched and only the warning fires. Breaches are reported AGGREGATED (count
+    + worst step), never one line per step.
+
+    This is the [BSS/soc] level: cumulative ENERGY. Its instantaneous POWER
+    counterpart, [BSS/schedule], lives in _read_bss_schedule.
+
+    Returns
+    -------
+    soc : np.ndarray          # fraction 0..1, SoC at the END of each step
+    p_applied : np.ndarray    # MW, clipped when bss_enforce_limits is True
+    warnings : list[str]
+    """
+    dt_h = 24.0 / STEPS_PER_DAY
+    e_max_mwh = float(config['bss_park_e_kwh']) / 1000.0
+    e_min_mwh = BSS_SOC_MIN_FRAC * e_max_mwh
+    eta = float(config['bss_eta'])
+    enforce = bool(config['bss_enforce_limits'])
+
+    p_applied = np.asarray(p_mw, dtype=float).copy()
+    soc = np.empty(len(p_applied), dtype=float)
+    e_mwh = soc_init * e_max_mwh
+
+    n_out, worst_step, worst_soc = 0, None, None
+    for k, p in enumerate(p_applied):
+        # Charge and discharge do not cost the same: efficiency multiplies what
+        # reaches the cells, and divides what has to be drawn from them.
+        delta = p * dt_h * eta if p > 0 else p * dt_h / eta
+        e_new = e_mwh + delta
+        if e_new > e_max_mwh + 1e-12 or e_new < e_min_mwh - 1e-12:
+            n_out += 1
+            frac = e_new / e_max_mwh
+            # "worst" = furthest from the middle of the band, in either direction
+            if worst_soc is None or abs(frac - 0.5) > abs(worst_soc - 0.5):
+                worst_step, worst_soc = k, frac
+            if enforce:
+                e_clipped = min(max(e_new, e_min_mwh), e_max_mwh)
+                delta = e_clipped - e_mwh
+                p_applied[k] = (delta / (dt_h * eta)) if delta > 0 else (delta * eta / dt_h)
+                e_new = e_clipped
+        e_mwh = e_new
+        soc[k] = e_mwh / e_max_mwh
+
+    warnings = []
+    if n_out:
+        warnings.append(
+            f"[BSS/soc] state of charge leaves the "
+            f"[{100 * BSS_SOC_MIN_FRAC:.0f}%, 100%] band at {n_out} of "
+            f"{len(p_applied)} step(s) -- schedule inconsistent with "
+            f"config['bss_park_e_kwh'] ({float(config['bss_park_e_kwh']):.1f} kWh); "
+            f"worst at step {worst_step} ({100 * worst_soc:.1f}%)"
+            + (" -- clipped (bss_enforce_limits=True)." if enforce
+               else " -- applied as-is (bss_enforce_limits=False).")
+        )
+    return soc, p_applied, warnings
+
+
+# ============================================================
 #  3. TIME-SERIES POWER FLOW
 # ============================================================
-def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None):
+def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None,
+                   df_bss_p=None):
     """Attach controllers and run the time-series power flow.
 
     Loads are ALWAYS included. When `df_pv_p` is provided (columns 'pv_{bus_id}',
@@ -262,10 +597,15 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None):
     (overvoltage, reverse flows) are logged too. When `df_pv_p` is None, the
     power flow is loads-only.
 
+    When `df_bss_p` is provided (single column BSS_STORAGE_NAME, MW; storage
+    already created by _inject_bss_storage), the park is driven too. Positive =
+    charge, so it ADDS to consumption where a PV sgen subtracts from it.
+
     Returns
     -------
-    dict : 'vm', 'line_load', 'trafo_load' (always) and, with PV,
-    'line_p_from', 'trafo_p_hv', 'ext_grid_p', 'sgen_p_out'.
+    dict : 'vm', 'line_load', 'trafo_load' (always), with PV
+    'line_p_from', 'trafo_p_hv', 'ext_grid_p', 'sgen_p_out', and with BSS
+    'storage_p'.
     """
     net.controller = net.controller.iloc[0:0]  # avoid stacking controllers on repeated calls
 
@@ -286,6 +626,13 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None):
             ConstControl(net, element='sgen', variable='p_mw', element_index=[i],
                          data_source=data_source_pv, profile_name=sgen["name"])
 
+    with_bss = df_bss_p is not None
+    if with_bss:
+        data_source_bss = DFData(df_bss_p)
+        for i, storage in net.storage.iterrows():
+            ConstControl(net, element='storage', variable='p_mw', element_index=[i],
+                         data_source=data_source_bss, profile_name=storage["name"])
+
     n_timesteps = config['n_timesteps']
     # output_path=None -> results collected in memory only (ow.output), no CSV
     # round-trip through disk: cleaner for a callable module.
@@ -298,6 +645,8 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None):
         ow.log_variable('res_trafo', 'p_hv_mw')      # sign: <0 = reverse HV->LV flow on this transformer
         ow.log_variable('res_ext_grid', 'p_mw')      # sign: <0 = network exports upstream
         ow.log_variable('res_sgen', 'p_mw')
+    if with_bss:
+        ow.log_variable('res_storage', 'p_mw')       # sign: >0 = charging
 
     run_timeseries(net, time_steps=range(n_timesteps), verbose=False)
 
@@ -311,6 +660,8 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None):
         out['trafo_p_hv'] = ow.output['res_trafo.p_hv_mw']
         out['ext_grid_p'] = ow.output['res_ext_grid.p_mw']
         out['sgen_p_out'] = ow.output['res_sgen.p_mw']
+    if with_bss:
+        out['storage_p'] = ow.output['res_storage.p_mw']
     return out
 
 
@@ -512,7 +863,19 @@ def run_digital_twin(config, metadata, network, households,
         pv.build_pv_production, which outputs kW, convert /1000 upstream, see
         main.py). When provided: injected as sgen, loads + PV power flow. When
         None: no PV (loads-only).
-    schedules_BSS : pd.DataFrame, optional   # not supported yet (warning if provided)
+    schedules_BSS : pd.DataFrame, optional
+        Central battery park schedule. One or more NUMERIC power columns (one per
+        battery / agent / park sub-unit -- names are free), summed column-wise
+        into a single park aggregate; a pre-aggregated single column is the same
+        case. Time index aligned on households. Values in **kW** -- the only kW
+        interface here, households and pv_profiles are in MW.
+        SIGN: positive = CHARGING, negative = discharge -- the storage
+        convention, OPPOSITE of the sgen one `pv_profiles` follows.
+        When provided: injected as ONE storage element on config['bss_bus'],
+        driven per timestep, SoC tracked and reported (bss_* metrics). When None:
+        no BSS. Passing the schedule IS the activation, as for pv_profiles.
+        Related config: bss_bus / bss_park_e_kwh / bss_park_p_kw / bss_eta /
+        bss_enforce_limits (see digital_twin.utils._config_to_dict).
 
     Returns
     -------
@@ -544,13 +907,59 @@ def run_digital_twin(config, metadata, network, households,
         _verify_temporal_alignment(df_p, df_pv_p)   # index guardrail
         _inject_pv_sgens(net, df_pv_p)
 
-    pf = _run_powerflow(net, df_p, df_q, cfg, df_pv_p=df_pv_p)
+    # --- BSS injection (activation by PRESENCE, like pv_profiles above) ---
+    # Schedule reduced to one park column, storage created on config['bss_bus'],
+    # SoC integrated, and the (possibly clipped) series drives it in _run_powerflow.
+    # households.index is passed for the offset pre-check -- df_p has already lost
+    # its own to .values in _assign_loads.
+    df_bss_p, bss_summary = None, {}
+    if schedules_BSS is not None and len(schedules_BSS) > 0:
+        df_bss_p, n_bss_cols, w_bss = _read_bss_schedule(
+            schedules_BSS, df_p, cfg, load_time_index=households.index)
+        warnings += w_bss
+        _inject_bss_storage(net, cfg, network['mv_nodes'])
+
+        # Simulated horizon only: a statement about the steps that actually run.
+        n_bss = min(int(cfg['n_timesteps']), len(df_bss_p))
+        soc, p_applied, w_soc = _track_bss_soc(
+            df_bss_p[BSS_STORAGE_NAME].to_numpy()[:n_bss], cfg)
+        warnings += w_soc
+        # Clipped values written back where the ConstControl reads them, so the
+        # power flow applies what the SoC was integrated from (see _track_bss_soc).
+        df_bss_p.iloc[:n_bss, df_bss_p.columns.get_loc(BSS_STORAGE_NAME)] = p_applied
+
+        p_applied_kw = p_applied / _BSS_KW_TO_MW
+        dt_h = 24.0 / STEPS_PER_DAY
+        charge_kw = p_applied_kw[p_applied_kw > 0]
+        discharge_kw = p_applied_kw[p_applied_kw < 0]
+        bss_summary = {
+            'bss_bus': cfg['bss_bus'],
+            'bss_n_schedule_columns': n_bss_cols,
+            'bss_timesteps': n_bss,
+            'bss_park_e_kwh': cfg['bss_park_e_kwh'],
+            'bss_park_p_kw': cfg['bss_park_p_kw'],
+            # Signed peaks, now that the convention is fixed: positive = charge.
+            'bss_peak_charge_kw': float(charge_kw.max()) if len(charge_kw) else 0.0,
+            'bss_peak_discharge_kw': float(discharge_kw.min()) if len(discharge_kw) else 0.0,
+            'bss_mean_kw': float(p_applied_kw.mean()),
+            'bss_soc_min_pct': 100.0 * float(soc.min()),
+            'bss_soc_max_pct': 100.0 * float(soc.max()),
+            'bss_soc_final_pct': 100.0 * float(soc[-1]),
+            'bss_energy_charged_kwh': float(charge_kw.sum()) * dt_h,
+            'bss_energy_discharged_kwh': float(discharge_kw.sum()) * dt_h,
+        }
+
+    pf = _run_powerflow(net, df_p, df_q, cfg, df_pv_p=df_pv_p, df_bss_p=df_bss_p)
     vm, line_load, trafo_load = pf['vm'], pf['line_load'], pf['trafo_load']
 
     summary, violations = _evaluate(vm, line_load, trafo_load, cfg)
 
     agg_summary, agg_mw = _aggregate_profile_summary(df_p)
     summary.update(agg_summary)
+
+    # In kW like the load aggregate, and only when the layer ran -- so a
+    # loads(+PV) verdict keeps exactly the keys it had before BSS existed.
+    summary.update(bss_summary)
 
     out = _format_output(summary, violations, warnings)
 

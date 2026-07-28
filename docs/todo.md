@@ -21,6 +21,9 @@ status):
   (`run_digital_twin`).
 - Wire `run_digital_twin` into `communication_agents.py` in the MAS4TE
   framework (see [Interfacing](interfacing.md)).
-- Extend the digital twin to make use of the `pv_profiles` and
-  `schedules_BSS` inputs (PV production and battery scheduling), not yet
-  reflected in the network simulation.
+- Inject `schedules_BSS` into the network simulation. The schedule is currently
+  read, validated and summed into an aggregate park power series, but not
+  injected, so the power flow does not yet reflect battery scheduling. Settling
+  the sign convention (positive = charging or discharging) is part of this, as
+  is checking the aggregate against `bss_park_p_kw`. See the temporal-alignment
+  caveat under [Interfacing / Known limitations](interfacing.md#known-limitations).
