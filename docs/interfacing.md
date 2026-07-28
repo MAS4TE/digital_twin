@@ -32,12 +32,44 @@ The schedule of the **central battery park**. Any number of numeric power
 columns is accepted — one per battery, per agent, or per park sub-unit — and
 they are summed column-wise into a single aggregate park power series. A
 single pre-aggregated column is the same case, not a special one. The number
-of columns read is always reported back as a `[BSS/schedule]` warning, so the
+of columns read is always reported back as a `[BSS/read]` warning, so the
 caller can confirm the file received is the file expected.
 
-Currently the schedule is **read, validated, summed and reported** (the
-`bss_n_schedule_columns`, `bss_peak_abs_kw` and `bss_mean_kw` summary metrics)
-but **not injected**: the power flow result is identical with and without it.
+The aggregate is **injected** into the power flow as a single pandapower
+`storage` element on the MV node named by `config['bss_bus']`, driven timestep
+by timestep. The state of charge is integrated alongside and reported, together
+with the park specs and the energy exchanged, as the `bss_*` summary metrics:
+
+| Metric                                                    | Meaning                                     |
+|-----------------------------------------------------------|---------------------------------------------|
+| `bss_bus`                                                 | MV node carrying the park                   |
+| `bss_n_schedule_columns`                                  | Columns summed into the aggregate           |
+| `bss_timesteps`                                           | Steps actually simulated                    |
+| `bss_park_e_kwh`, `bss_park_p_kw`                         | Park capacity and power rating in use       |
+| `bss_peak_charge_kw`, `bss_peak_discharge_kw`             | Signed peaks of the applied series          |
+| `bss_mean_kw`                                             | Mean applied power                          |
+| `bss_soc_min_pct`, `bss_soc_max_pct`, `bss_soc_final_pct` | State of charge over the run                |
+| `bss_energy_charged_kwh`, `bss_energy_discharged_kwh`     | Energy exchanged at the interface           |
+
+```{note}
+The park being a single MV-connected asset, its effect on the *aggregate*
+verdict metrics is small: the network-wide voltage shift measured on Bressoux
+is around 0.001 pu. The `bss_*` metrics describe the battery; they do not
+measure its effect on the network. Comparing a run with and without
+`schedules_BSS` is what shows the latter.
+```
+
+**Sign convention.** Positive = **charging** (the park consumes, seen from the
+grid), negative = discharge. This is pandapower's `storage` convention, and the
+*opposite* of the `sgen` convention `pv_profiles` follows, where positive means
+injection. Both live in the same engine, so the asymmetry is worth keeping in
+mind when preparing the two inputs.
+
+**Feasibility.** Two independent checks warn without rejecting: the
+instantaneous power against `config['bss_park_p_kw']` (`[BSS/schedule]`) and
+the cumulative energy against `config['bss_park_e_kwh']` (`[BSS/soc]`). Both
+are clipped rather than applied as-is when `config['bss_enforce_limits']` is
+set, which is the default.
 
 ```{warning}
 `schedules_BSS` is in **kW**, while `households` and `pv_profiles` are in

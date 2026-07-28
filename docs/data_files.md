@@ -32,6 +32,39 @@ bus_id,kwp,type,street
 5,12.0,rest_home,
 ```
 
+## `inputs/bss_shares.csv`
+
+The BSS share register: which bus holds a contractual share of the central
+battery park, and how much energy that share is. Produced by
+`generate_bss_shares` (see [BSS modelling](bss_modelling.md)), and like
+`pv_installations.csv` it lives under `inputs/` once generated — a stable
+register, not rebuilt by `process_data` on every run. A scenario opts into the
+battery simply by having this file.
+
+Note this register describes **shares of one central park**, not batteries
+sitting at each bus: `bus_id` says who holds the share, not where a battery is
+installed. The park itself sits on `config['bss_bus']`.
+
+| Column   | Type            | Description                                                     |
+|----------|-----------------|-----------------------------------------------------------------|
+| `bus_id` | `int64`         | LV bus of the household holding the share.                      |
+| `e_kwh`  | `float64`       | Energy of the share (kWh). The sum equals `bss_park_e_kwh`.     |
+| `street` | `str`           | Street of the holding bus (traceability).                       |
+
+```{code-block} text
+bus_id,e_kwh,street
+9,7.807808,Rue Ernest Malvoz
+10,7.807808,Rue Ernest Malvoz
+11,7.807808,Rue Ernest Malvoz
+```
+
+```{warning}
+`sum(e_kwh)` must not exceed `config['bss_park_e_kwh']` — the shares cannot
+oversubscribe the park they are shares of. `generate_bss_shares` guarantees
+this by construction; `utils.check_bss_energetic_feasibility` verifies it for
+a register produced elsewhere.
+```
+
 ## `out/processed/metadata.csv`
 
 Per-household attributes -- the `metadata` argument of `run_digital_twin`.

@@ -15,15 +15,19 @@ status):
   Google Maps rather than actual GIS data.
 - Reduce the number of households **randomly assigned** to a load profile
   when their street could not be matched to a metered EAN.
-- Finish migrating the network-reconstruction and simulation logic from
-  [power_flow.ipynb](../power_flow.ipynb) into
-  [digital_twin/digital_twin.py](../digital_twin/digital_twin.py)
-  (`run_digital_twin`).
 - Wire `run_digital_twin` into `communication_agents.py` in the MAS4TE
   framework (see [Interfacing](interfacing.md)).
-- Inject `schedules_BSS` into the network simulation. The schedule is currently
-  read, validated and summed into an aggregate park power series, but not
-  injected, so the power flow does not yet reflect battery scheduling. Settling
-  the sign convention (positive = charging or discharging) is part of this, as
-  is checking the aggregate against `bss_park_p_kw`. See the temporal-alignment
-  caveat under [Interfacing / Known limitations](interfacing.md#known-limitations).
+- Wire the two upstream BSS checks
+  (`utils.check_bss_config_specs`, `utils.check_bss_energetic_feasibility`).
+  Both are written and tested but called from nowhere, so the park specs can
+  silently fall back to their defaults and the per-household slices are never
+  verified against the park capacity.
+- Decide whether the BSS schedule should be driven by the **aggregate** net
+  load rather than per-bus net load. The park is a single MV-connected asset,
+  so it only ever sees aggregate flows; the current generator
+  (`data_processing/bss.py`) sums per-bus signals that would only be meaningful
+  for storage behind each meter. See
+  [BSS modelling](bss_modelling.md#a-known-modelling-tension).
+- Measure the network **effect** of the park, not just its own metrics: a run
+  with and without `schedules_BSS`, comparing voltage envelopes rather than the
+  rounded aggregate verdict values.

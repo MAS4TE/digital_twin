@@ -3,12 +3,17 @@
 Digital twin of a low-voltage distribution network, developed as part of the
 **MAS4TE** project -- Bressoux (Liège) is the first site it was built for. The
 core entry point is `run_digital_twin` (`digital_twin/digital_twin.py`), a
-network-agnostic engine: it takes a network, household metadata and
-consumption/PV profiles as arguments (the network itself is a caller-supplied
-input, produced by a site-specific `inputs/network.py`, not built into the
-package) and returns a network verdict (voltages, loadings, violations). This
-is what makes it reusable for a different LV network without touching
-`digital_twin/`.
+network-agnostic engine: it takes a network, household metadata, consumption
+profiles and PV production and a battery schedule as arguments
+(the network itself is a caller-supplied input, produced by a site-specific
+`inputs/network.py`, not built into the package) and returns a network verdict
+(voltages, loadings, violations). This is what makes it reusable for a
+different LV network without touching `digital_twin/`.
+
+The battery layer models **one centralised storage park on an MV node**, not
+distributed household batteries: households hold contractual *shares* of that
+single park. See the *Interfacing* page of the documentation for the schedule
+format and its conventions.
 
 ## Using it as a dependency
 
@@ -73,6 +78,8 @@ data/bressoux/
     part-*.csv                  # raw smart-meter readings (anonymised EAN)
     pv_installations.csv        # OPTIONAL -- PV installation register (bus_id, kwp, type, street);
                                 # a scenario opts into PV simply by having this file
+    bss_shares.csv              # OPTIONAL -- BSS contractual share register (bus_id, e_kwh, street);
+                                # a scenario opts into the battery simply by having this file
   out/
     processed/                # DERIVED data, regenerated from inputs/ by the site's
                                 # data pipeline (e.g. bressoux_setup.ipynb):
@@ -122,9 +129,13 @@ generated file.
    ```
 
    If `inputs/pv_installations.csv` exists, PV production is built and
-   injected automatically -- nothing else to configure. Set
-   `config['save'] = True` in `main.py` to write a Markdown run report
-   (summary/violations/warnings) to `out/results/`.
+   injected automatically -- nothing else to configure. Same rule for the
+   battery: if `inputs/bss_shares.csv` exists, the park schedule is built from
+   it and injected as a storage element, and the run report gains the `bss_*`
+   metrics (bus, state of charge, energy charged/discharged). Either file
+   missing simply means that layer is off. `config['save']` (already `True` in
+   `main.py`) writes a Markdown run report (summary/violations/warnings) to
+   `out/results/`.
 
 The steps below are only needed for the separate monthly-bank / PV
 impact-analysis tooling (`scripts/pv_impact_analysis.py`), not for the basic
@@ -151,8 +162,19 @@ impact-analysis tooling (`scripts/pv_impact_analysis.py`), not for the basic
 
    Writes `inputs/pv_installations.csv`.
 
+5. **BSS share register** (which buses hold a share of the central park, and
+   how much energy each -- only needed to generate a *new* `bss_shares.csv`;
+   the one already in `inputs/` is used as-is otherwise):
+
+   ```bash
+   python -c "from digital_twin.data_processing.bss import generate_bss_shares; generate_bss_shares({'data_path': 'data/bressoux'})"
+   ```
+
+   Writes `inputs/bss_shares.csv` -- one share per LV bus, of equal energy,
+   summing to `config['bss_park_e_kwh']`.
+
 Once the generated files exist, only step 2 needs to be repeated for
-day-to-day runs; steps 1, 3 and 4 are one-off (re-run them only if the
+day-to-day runs; steps 1 and 3 to 5 are one-off (re-run them only if the
 sources change).
 
 ## Repository layout
@@ -160,11 +182,13 @@ sources change).
 - `digital_twin/` — the network-agnostic engine (`digital_twin.py`,
   `run_digital_twin`, `save_run_report`), shared helpers (`utils.py`), and the
   upstream data generators (`data_processing/profiles.py`,
-  `data_processing/pv.py`, `data_processing/process_data.py`).
+  `data_processing/pv.py`, `data_processing/bss.py`,
+  `data_processing/process_data.py`).
 - `data/<site>/inputs/network.py` — the site-specific topology builder (NOT
   part of the installable package — this is what a new site replaces).
 - `main.py` — orchestration/demo: load a scenario's inputs, then run the twin.
-- `scripts/` — verification and visualisation scripts (checks, impact analysis,
-  figures).
+- `scripts/` — impact analysis and figures (run from `scripts/`, not from the
+  repository root).
 - `docs/` — Sphinx documentation.
-- `archives/` — superseded scripts kept for reference.
+- `archives/` — superseded scripts, and one-off checks whose proof is done,
+  kept for reference (see `archives/README.md`).
