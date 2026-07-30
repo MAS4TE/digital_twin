@@ -1,52 +1,53 @@
 """
-BSS generation: contractual share register + net-load-driven schedule generator,
-producing the `schedules_BSS` input of run_digital_twin.
+BSS generation: the reference schedule generator producing the `schedules_BSS`
+input of run_digital_twin.
 
-Reference implementation and test harness, not the production source: in MAS4TE
-the schedule comes from the agents' own optimisation. Nothing here is imported by
-digital_twin.digital_twin -- the dependency goes one way only.
+Reference implementation and test harness, NOT the production source: in MAS4TE
+the schedule comes from the agents' own optimisation. digital_twin.digital_twin
+never imports this module -- the dependency goes one way only, and this module
+imports the engine's format constants rather than restating them, so the two
+cannot drift.
 
-MODEL. One physical central park at an MV node (config['bss_bus']) plus N
-contractual shares of it. A share is not a battery in a garage: the household
-exports its surplus and the park absorbs the equivalent at the MV node. The
-energy accounting holds, the electrons do not take that path -- so the park
-supports the MV node, NOT the owner's LV feeder. Do not read a local voltage
-benefit into the results.
+MODEL. A FLEET of physically distinct batteries, read off the scenario's
+equipment table:
+    b0     -- the CENTRAL battery at an MV node (config['bss_bus']), capacity and
+              power from config['bss_park_e_kwh'] / config['bss_park_p_kw'].
+    b1..bn -- one DOMESTIC battery per equipped LV bus, capacity from the table's
+              `battery_size_kwh` column, power DERIVED from the central park's
+              C-rate (utils.bss_c_rate) so the fleet stays one technology at two
+              scales.
 
-Brick 1 -- generate_bss_shares : one share per LV bus, equal energy -> bss_shares.csv
-Brick 2 -- build_bss_schedule  : per-share net load -> N columns in kW (no pandapower)
+A domestic battery sits on its own bus and its power flows through its own LV
+feeder -- it is a physical battery in a garage, not an accounting share of the
+central park.
 
-Each share schedules against ITS OWN bus's net load, hence one column per share
-rather than a single aggregate: a PV bus goes into surplus at midday, a bus
-without PV never does -- two different shapes, not one shape at two scales.
-digital_twin._read_bss_schedule sums the columns at the interface.
+Each battery schedules against ITS OWN net load, hence one series per battery: a
+bus with PV goes into surplus at midday, a bus without never does -- two
+different shapes, not one shape at two scales.
+
+OUTPUT FORMAT is LONG (index = week steps repeated per battery, columns
+battery_id + p_kw), because that is what carries the identifier the twin matches
+against the equipment table. See digital_twin.digital_twin's "2ter" section.
 
 UNITS. kW, positive = CHARGING (the storage convention of the twin's interface,
 see digital_twin._inject_bss_storage). `schedules_BSS` is the twin's only kW
 interface -- unlike pv.build_pv_production, whose kW are converted to MW upstream
 in process_data -- so nothing is converted here.
 """
-import os
-
 import numpy as np
 import pandas as pd
 
-from ..utils import (STEPS_PER_DAY, STEPS_PER_WEEK, _WEEK_TIME_INDEX,
-                     _config_to_dict, load_site_network)
+from ..digital_twin import (BSS_BATTERY_ID_COLUMN, BSS_CENTRAL_ID,
+                            BSS_POWER_COLUMN, _bss_domestic_register)
+from ..utils import (BSS_SOC_INIT, BSS_SOC_MIN_FRAC, STEPS_PER_DAY,
+                     STEPS_PER_WEEK, _WEEK_TIME_INDEX, _config_to_dict,
+                     bss_c_rate)
+from .equipment import BUS_TYPE_LV
 
-BSS_SHARES_PATH = "data/bressoux/inputs/bss_shares.csv"
-
-# Mirrors digital_twin.BSS_SOC_MIN_FRAC, duplicated rather than imported to keep
-# this module independent of the engine. If the engine's reserve changes, change
-# it here too: a mismatch only produces [BSS/soc] warnings, never silent drift.
-SHARE_SOC_MIN_FRAC = 0.1
-SHARE_SOC_INIT = 0.5
-
-# No 'seed' key: the register is deterministic (one slice per LV bus, equal
-# energy), so there is no draw left to seed.
+# No 'seed' key: the fleet comes from the equipment table and every schedule is
+# a deterministic function of the net load, so there is no draw left to seed.
 DEFAULTS = {
-    "out_path": BSS_SHARES_PATH,
-    # Quantiles of each share's own daily net load, never absolute kW: the
+    # Quantiles of each battery's own daily net load, never absolute kW: the
     # aggregate net load never goes negative at this site, so an absolute
     # "charge on surplus" rule would almost never fire.
     "q_charge": 0.30,              # charge below this daily quantile of p_net
@@ -54,79 +55,48 @@ DEFAULTS = {
 }
 
 
-# ============================================================
-#  Brick 1 -- contractual share register
-# ============================================================
-def generate_bss_shares(config=None):
-    """Generate `bss_shares.csv` (or cfg['out_path']): one share per LV bus, all
-    of equal energy.
+def _bus_load_lookup(households, metadata):
+    """{bus_id -> that bus's household load [kW]}, from the declared assignment.
 
-    Every bus of network['buses'] gets a slice -- no draw, no selection, so the
-    share count is not configurable: it IS the number of LV buses. Sizing is
-    uniform (bss_park_e_kwh / n), deliberately not weighted by load or PV: this
-    is a test fixture, and a uniform split makes `sum(e_kwh) == bss_park_e_kwh`
-    hold by construction.
-
-    Expected consequence, not a defect: only 30 of the 333 Bressoux LV buses
-    carry PV, so 303 shares schedule with no PV term at all and their "charge in
-    the night valley" shape dominates the park aggregate. That is this
-    neighbourhood's real 9% PV penetration showing through.
-
-    Returns
-    -------
-    shares : pd.DataFrame   # columns bus_id, e_kwh, street
+    Empty when `metadata` carries no `bus_id`: callers then fall back to the pool
+    mean, which plans every battery against the average household rather than the
+    load it will actually see.
     """
-    cfg = {**DEFAULTS, **_config_to_dict(config)}
-
-    network = load_site_network(cfg)          # READ-ONLY, for bus_id <-> street
-    buses = network['buses']                  # (street, num) -> LV bus id
-
-    share_buses = sorted(int(b) for b in buses.values())
-    n_shares = len(share_buses)
-    if n_shares == 0:
-        raise ValueError(
-            "network['buses'] is empty: no LV bus to place a BSS share on."
-        )
-
-    # The last slice absorbs the division residual: utils.check_bss_energetic_
-    # feasibility compares with a strict `>` and no tolerance, so a total of
-    # 2600.0001 would be reported as an oversubscription of "0.0 kWh".
-    park_e = float(cfg['bss_park_e_kwh'])
-    e_kwh = np.round(np.full(n_shares, park_e / n_shares), 6)
-    e_kwh[-1] += park_e - e_kwh.sum()
-
-    bus_street = {int(b): s for (s, _n), b in buses.items()}
-    shares = pd.DataFrame({
-        "bus_id": share_buses,
-        "e_kwh": e_kwh,
-        "street": [bus_street[b] for b in share_buses],
-    })
-
-    out_path = cfg['out_path']
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    shares.to_csv(out_path, index=False)
-    return shares
+    if metadata is None or 'bus_id' not in getattr(metadata, 'columns', []):
+        return {}
+    lookup = {}
+    for bus_id, pid in zip(metadata['bus_id'], metadata['profile_id']):
+        col = f"profile_{pid}"
+        if pd.notna(bus_id) and col in households.columns:
+            lookup[int(bus_id)] = households[col].to_numpy(dtype=float) * 1000.0
+    return lookup
 
 
-# ============================================================
-#  Brick 2 -- net-load-driven schedule
-# ============================================================
-def _representative_load_kw(households):
-    """Mean household load across the profile pool [kW].
-
-    Not the actual load of each share's bus: the household -> bus assignment is
-    drawn inside digital_twin._assign_loads at run time and does not exist
-    upstream. The signal that shapes the schedule is PV presence, which IS known
-    exactly per bus -- so the exact part stays exact and only the load is
-    approximated.
-    """
+def _mean_load_kw(households):
+    """Mean household load across the profile pool [kW] -- the FALLBACK used when
+    no assignment is declared, and the shape the central battery would see if it
+    had to guess."""
     return households.mean(axis=1).to_numpy(dtype=float) * 1000.0  # MW -> kW
 
 
-def _schedule_one_share(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
-    """Greedy self-consumption + peak-shaving schedule for ONE share.
+def _pv_kw(pv_profiles, bus_id, n_steps):
+    """PV production of ONE bus [kW], zeros when it carries none.
 
-    Per day, the share charges when its net load sits in the low quantile (PV
+    A bus without PV is the correct degenerate case, not an error: its battery
+    then schedules on the load valley/peak alone.
+    """
+    if pv_profiles is None:
+        return np.zeros(n_steps, dtype=float)
+    col = f"pv_{int(bus_id)}"
+    if col not in pv_profiles.columns:
+        return np.zeros(n_steps, dtype=float)
+    return pv_profiles[col].to_numpy(dtype=float)[:n_steps] * 1000.0  # MW -> kW
+
+
+def _schedule_one_battery(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
+    """Greedy self-consumption + peak-shaving schedule for ONE battery.
+
+    Per day, the battery charges when its net load sits in the low quantile (PV
     surplus hours and the night valley) and discharges in the high quantile (the
     evening peak). Per day rather than per week so the rule follows the
     weekday/weekend shape. Power is proportional to the excursion beyond the
@@ -134,12 +104,13 @@ def _schedule_one_share(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
 
     Each day closes energy-neutral, balanced on CELL-side energy: charging stores
     p*dt*eta and discharging draws p*dt/eta, exactly as the engine's
-    _track_bss_soc computes it, so a full cycle costs eta**2. Balancing on
-    meter-side kWh instead ignores the round-trip loss and drains the park a
+    _track_one_soc computes it, so a full cycle costs eta**2. Balancing on
+    meter-side kWh instead ignores the round-trip loss and drains the battery a
     little every day.
 
-    The SoC walk on top caps power by the room left in [SHARE_SOC_MIN_FRAC, 1.0],
-    which is what makes the result feasible rather than merely plausible.
+    The SoC walk on top caps power by the room left in [BSS_SOC_MIN_FRAC, 1.0] --
+    the SAME band the engine enforces, imported rather than restated, so a
+    schedule built here is feasible there.
 
     Returns
     -------
@@ -150,8 +121,8 @@ def _schedule_one_share(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
     dt_h = 24.0 / STEPS_PER_DAY
 
     e_max = float(e_kwh)
-    e_min = SHARE_SOC_MIN_FRAC * e_max
-    e = SHARE_SOC_INIT * e_max
+    e_min = BSS_SOC_MIN_FRAC * e_max
+    e = BSS_SOC_INIT * e_max
 
     for start in range(0, n, STEPS_PER_DAY):
         day = p_net_kw[start:start + STEPS_PER_DAY]
@@ -163,10 +134,10 @@ def _schedule_one_share(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
         want_chg = np.clip(lo_thr - day, 0.0, None)
         want_dis = np.clip(day - hi_thr, 0.0, None)
 
-        # Each side scaled INDEPENDENTLY to the rating. A shared
-        # max(chg, dis) normaliser would let a PV bus's deep midday trough shrink
-        # its own discharge side, and the neutrality rebalance would then drag
-        # the charge down to match -- throttling the shares with the most surplus.
+        # Each side scaled INDEPENDENTLY to the rating. A shared max(chg, dis)
+        # normaliser would let a PV bus's deep midday trough shrink its own
+        # discharge side, and the neutrality rebalance would drag the charge down
+        # to match -- throttling the batteries with the most surplus.
         if want_chg.max() > 0:
             want_chg *= p_max_kw / want_chg.max()
         if want_dis.max() > 0:
@@ -196,88 +167,126 @@ def _schedule_one_share(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
     return p_kw
 
 
-def build_bss_schedule(households, pv_profiles, shares, config=None):
-    """Build `schedules_BSS`: one kW column per contractual share.
+def build_bss_schedule(households, pv_profiles, equipment, metadata=None,
+                       config=None, include_central=True):
+    """Build `schedules_BSS` in LONG format for the scenario's whole fleet.
 
     Parameters
     ----------
     households : pd.DataFrame   # consumption timeseries, MW
     pv_profiles : pd.DataFrame or None
         PV production, MW, columns 'pv_{bus_id}'. None, or a bus with no PV,
-        means no surplus term for that share -- it then schedules on the load
-        valley/peak alone, which is the correct degenerate case, not an error.
-    shares : pd.DataFrame       # bss_shares.csv: bus_id, e_kwh
+        means no surplus term for that battery.
+    equipment : pd.DataFrame    # the bus-level register (bus_id, battery_id,
+        battery_size_kwh) -- the fleet's placement and sizing, see
+        data_processing.equipment.
+    metadata : pd.DataFrame or None
+        Household table carrying the declared household -> bus assignment
+        (`bus_id`). When given, EACH domestic battery is scheduled against the
+        load of ITS OWN bus. Without it, every battery falls back to the pool
+        mean and plans against a load its bus will never see.
     config : dict or None
-        Reads bss_park_e_kwh, bss_park_p_kw, bss_eta, q_charge, q_discharge.
-        `bss_eta` is the SAME key the engine uses -- planning against a different
-        efficiency than the twin applies is what makes a schedule drift.
+        Reads bss_park_e_kwh, bss_park_p_kw, bss_c_rate, bss_eta, q_charge,
+        q_discharge. `bss_eta` is the SAME key the engine uses -- planning
+        against a different efficiency than the twin applies is what makes a
+        schedule drift.
+    include_central : bool
+        Whether to schedule b0 alongside the domestic batteries. False yields a
+        purely domestic fleet, which the twin accepts (no storage is then created
+        on config['bss_bus']).
 
     Returns
     -------
     schedules_BSS : pd.DataFrame
-        Columns 'bss_{bus_id}', kW, positive = charging. Index is the labelled
-        weekly index matching `households`, so _read_bss_schedule's [BSS/align]
-        check can verify alignment instead of trusting a bare RangeIndex.
+        Index = the labelled weekly index matching `households`, repeated once
+        per battery; columns 'battery_id' and 'p_kw'. b0 first, then b1..bn.
+        The labelled index (rather than a bare RangeIndex) is what lets the
+        engine's [BSS/align] check verify alignment instead of trusting the
+        provider.
     """
     cfg = {**DEFAULTS, **_config_to_dict(config)}
-    if shares is None or len(shares) == 0:
-        raise ValueError("`shares` is empty: nothing to schedule (see generate_bss_shares).")
 
-    load_kw = _representative_load_kw(households)
-    n_steps = len(load_kw)
+    register = _bss_domestic_register(equipment)
+    if not register and not include_central:
+        raise ValueError(
+            "Nothing to schedule: the equipment table carries no domestic battery "
+            "and include_central=False."
+        )
 
-    park_e = float(cfg['bss_park_e_kwh'])
-    park_p = float(cfg['bss_park_p_kw'])
+    mean_load_kw = _mean_load_kw(households)
+    bus_load = _bus_load_lookup(households, metadata)
+    n_steps = len(mean_load_kw)
+    eta = float(cfg['bss_eta'])
+    q_charge, q_discharge = cfg['q_charge'], cfg['q_discharge']
 
-    columns = {}
-    for _, row in shares.iterrows():
-        bus_id = int(row['bus_id'])
-        e_kwh = float(row['e_kwh'])
+    series = {}
 
-        # PV of THIS bus, exactly -- the part of the signal worth keeping exact.
-        pv_col = f"pv_{bus_id}"
-        if pv_profiles is not None and pv_col in pv_profiles.columns:
-            pv_kw = pv_profiles[pv_col].to_numpy(dtype=float)[:n_steps] * 1000.0
-        else:
-            pv_kw = np.zeros(n_steps, dtype=float)
+    if include_central:
+        # The central battery answers to the WHOLE neighbourhood's net load, so
+        # its signal is the aggregate: the representative household load times
+        # the number of LV buses, minus all the PV. MV load facilities are not in
+        # it -- their profiles are read at run time by _assign_loads and do not
+        # exist upstream of the twin.
+        if equipment is None or 'bus_type' not in getattr(equipment, 'columns', []):
+            raise ValueError(
+                "Central battery schedule: the equipment table and its 'bus_type' "
+                "column are required to count the neighbourhood's LV buses "
+                "(see data_processing.equipment.build_equipment_skeleton)."
+            )
+        n_lv = int((equipment['bus_type'] == BUS_TYPE_LV).sum())
+        if n_lv == 0:
+            raise ValueError(
+                "Central battery schedule: no LV bus in the equipment table "
+                f"(bus_type == '{BUS_TYPE_LV}'), so the aggregate load would be zero "
+                "and the schedule constantly flat."
+            )
+        # Sum of the loads actually assigned when the assignment is declared;
+        # mean x n_lv otherwise. The two coincide under a 1:1 assignment, but the
+        # sum stays correct if that stops holding.
+        agg_load_kw = (np.sum(list(bus_load.values()), axis=0) if bus_load
+                       else mean_load_kw * n_lv)
+        agg_pv_kw = (pv_profiles.sum(axis=1).to_numpy(dtype=float)[:n_steps] * 1000.0
+                     if pv_profiles is not None else np.zeros(n_steps, dtype=float))
+        series[BSS_CENTRAL_ID] = _schedule_one_battery(
+            agg_load_kw - agg_pv_kw, float(cfg['bss_park_e_kwh']),
+            float(cfg['bss_park_p_kw']), q_charge, q_discharge, eta)
 
-        p_net_kw = load_kw - pv_kw
+    # A domestic battery's rating follows the central park's C-rate (see
+    # utils.bss_c_rate), keeping the fleet one technology at two scales.
+    c_rate = bss_c_rate(cfg)
+    for battery_id in sorted(register, key=lambda i: int(i[1:])):
+        entry = register[battery_id]
+        e_kwh = float(entry['e_kwh'])
+        # ITS OWN bus's load, not the pool average -- a home battery arbitrages
+        # the household it sits behind. Falls back to the mean only when no
+        # assignment was declared.
+        own_load_kw = bus_load.get(int(entry['bus_id']), mean_load_kw)[:n_steps]
+        p_net_kw = own_load_kw - _pv_kw(pv_profiles, entry['bus_id'], n_steps)
+        series[battery_id] = _schedule_one_battery(
+            p_net_kw, e_kwh, e_kwh * c_rate, q_charge, q_discharge, eta)
 
-        # Power slice proportional to the energy slice: a share cannot claim more
-        # of the inverter than it owns of the cells. Keeps the summed aggregate
-        # within bss_park_p_kw by construction, so [BSS/schedule] stays silent.
-        p_max_kw = park_p * (e_kwh / park_e) if park_e > 0 else 0.0
-
-        columns[f"bss_{bus_id}"] = _schedule_one_share(
-            p_net_kw, e_kwh, p_max_kw, cfg['q_charge'], cfg['q_discharge'],
-            float(cfg['bss_eta']))
-
-    index = _WEEK_TIME_INDEX[:n_steps] if n_steps <= STEPS_PER_WEEK else None
-    return pd.DataFrame(columns, index=index)
+    index = _WEEK_TIME_INDEX[:n_steps] if n_steps <= STEPS_PER_WEEK else range(n_steps)
+    return pd.concat([
+        pd.DataFrame({BSS_BATTERY_ID_COLUMN: battery_id, BSS_POWER_COLUMN: values},
+                     index=index)
+        for battery_id, values in series.items()
+    ])
 
 
-def load_bss_schedule(households, pv_profiles, config=None, inputs_dir=None):
-    """Read `<inputs_dir>/bss_shares.csv` and build the schedule from it.
+def load_bss_schedule(households, pv_profiles, equipment, metadata=None, config=None):
+    """Build the fleet schedule from the scenario's equipment table, or None.
 
-    Mirrors process_data._load_pv_profiles: returns None when the scenario has no
-    share register, a scenario opting into BSS simply by having the file.
+    ACTIVATION BY PRESENCE, exactly as process_data._load_pv_profiles does for
+    PV: the carrier is the table's CONTENT (any row with battery_size_kwh > 0),
+    not the existence of a file.
 
-    Parameters
-    ----------
-    households : pd.DataFrame            # consumption timeseries, MW
-    pv_profiles : pd.DataFrame or None   # PV production, MW
-    config : dict or None
-    inputs_dir : str or None             # defaults to <data_path>/inputs
+    A scenario wanting the central battery ALONE supplies its own schedule --
+    this module is a test harness, not the production source.
 
     Returns
     -------
-    schedules_BSS : pd.DataFrame or None   # kW, one column per share
+    schedules_BSS : pd.DataFrame or None   # long format, kW
     """
-    cfg = {**DEFAULTS, **_config_to_dict(config)}
-    if inputs_dir is None:
-        inputs_dir = f"{cfg['data_path'].rstrip('/')}/inputs"
-    shares_path = os.path.join(inputs_dir, "bss_shares.csv")
-    if not os.path.exists(shares_path):
+    if not _bss_domestic_register(equipment):
         return None
-    shares = pd.read_csv(shares_path)
-    return build_bss_schedule(households, pv_profiles, shares, config)
+    return build_bss_schedule(households, pv_profiles, equipment, metadata, config)
