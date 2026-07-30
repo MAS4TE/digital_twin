@@ -9,7 +9,8 @@ framework.
 ```{code-block} python
 from digital_twin import run_digital_twin
 
-out = run_digital_twin(config, metadata, network, households, pv_profiles=None, schedules_BSS=None)
+out = run_digital_twin(config, metadata, network, households,
+                       pv_profiles=None, schedules_BSS=None, equipment=None)
 ```
 
 | Argument         | Type               | Description                                                       |
@@ -19,7 +20,8 @@ out = run_digital_twin(config, metadata, network, households, pv_profiles=None, 
 | `network`        | `dict`             | Network bundle (`net`, `buses`, `mv_nodes`, ...) built by a site's `inputs/network.py` -- see [Interfacing / the network input](#the-network-input) below. |
 | `households`     | `pandas.DataFrame` | Household consumption timeseries.                                   |
 | `pv_profiles`    | `pandas.DataFrame`, optional | Photovoltaic production profiles, in **MW**. |
-| `schedules_BSS`  | `pandas.DataFrame`, optional | Battery park schedule, in **kW** -- see below. |
+| `schedules_BSS`  | `pandas.DataFrame`, optional | Battery fleet schedule, long format, in **kW** -- see below. |
+| `equipment`      | `pandas.DataFrame`, optional | Bus-level equipment register; required as soon as `schedules_BSS` names domestic batteries. |
 
 **Returns** a single `pandas.DataFrame` (`out`) containing the resulting
 time-series (voltages, loadings, ...) together with any warnings raised
@@ -28,48 +30,67 @@ street/substation).
 
 ### The `schedules_BSS` input
 
-The schedule of the **central battery park**. Any number of numeric power
-columns is accepted — one per battery, per agent, or per park sub-unit — and
-they are summed column-wise into a single aggregate park power series. A
-single pre-aggregated column is the same case, not a special one. The number
-of columns read is always reported back as a `[BSS/read]` warning, so the
-caller can confirm the file received is the file expected.
+The schedule of the **battery fleet**, in **long** format: the index is the time
+steps repeated once per battery, and there are exactly two columns,
+`battery_id` and `p_kw`.
 
-The aggregate is **injected** into the power flow as a single pandapower
-`storage` element on the MV node named by `config['bss_bus']`, driven timestep
-by timestep. The state of charge is integrated alongside and reported, together
-with the park specs and the energy exchanged, as the `bss_*` summary metrics:
+| index | `battery_id` | `p_kw` |
+|---|---|---|
+| `Mon 00:00` | `b0` | `+142.7` |
+| `Mon 00:15` | `b0` | `+138.2` |
+| … | … | … |
+| `Mon 00:00` | `b1` | `+1.4` |
 
-| Metric                                                    | Meaning                                     |
-|-----------------------------------------------------------|---------------------------------------------|
-| `bss_bus`                                                 | MV node carrying the park                   |
-| `bss_n_schedule_columns`                                  | Columns summed into the aggregate           |
-| `bss_timesteps`                                           | Steps actually simulated                    |
-| `bss_park_e_kwh`, `bss_park_p_kw`                         | Park capacity and power rating in use       |
-| `bss_peak_charge_kw`, `bss_peak_discharge_kw`             | Signed peaks of the applied series          |
-| `bss_mean_kw`                                             | Mean applied power                          |
-| `bss_soc_min_pct`, `bss_soc_max_pct`, `bss_soc_final_pct` | State of charge over the run                |
-| `bss_energy_charged_kwh`, `bss_energy_discharged_kwh`     | Energy exchanged at the interface           |
+`b0` is the **central** battery, placed on `config['bss_bus']`; `b1`…`bn` are
+**domestic** batteries, each on the LV bus the `equipment` table gives it. A
+battery exists exactly when the schedule names it, so central-only,
+domestic-only and both are all valid. The fleet actually read is reported back
+as a `[BSS/read]` warning, so the caller can confirm the file received is the
+file expected.
+
+Each battery is **injected** as its own pandapower `storage` element, on its own
+bus, driven timestep by timestep, with its own state of charge integrated
+alongside. The verdict carries the fleet **aggregate**:
+
+| Metric                                    | Meaning                                          |
+|-------------------------------------------|--------------------------------------------------|
+| `bss_n_batteries`, `bss_n_domestic`       | Fleet size, and how much of it is domestic       |
+| `bss_e_installed_kwh`                     | Total capacity actually installed                |
+| `bss_p_agg_max_kw`, `bss_p_agg_min_kw`    | Signed peaks of the applied fleet power          |
+| `bss_soc_min_pct`, `bss_soc_max_pct`      | State of charge extremes across the whole fleet  |
+
+Per-battery state of charge is opt-in through `config['export_bss_soc']`, which
+appends `category == 'bss_soc'` rows. Off by default: that is
+`n_batteries × n_timesteps` rows on every run.
 
 ```{note}
-The park being a single MV-connected asset, its effect on the *aggregate*
-verdict metrics is small: the network-wide voltage shift measured on Bressoux
-is around 0.001 pu. The `bss_*` metrics describe the battery; they do not
-measure its effect on the network. Comparing a run with and without
-`schedules_BSS` is what shows the latter.
+The `bss_*` metrics describe the batteries; they do not measure their effect on
+the network. Comparing a run with and without `schedules_BSS` is what shows the
+latter. Because a domestic battery sits on the LV feeder it supports, that
+effect is local and visible bus by bus rather than diluted at one MV node.
 ```
 
-**Sign convention.** Positive = **charging** (the park consumes, seen from the
-grid), negative = discharge. This is pandapower's `storage` convention, and the
-*opposite* of the `sgen` convention `pv_profiles` follows, where positive means
-injection. Both live in the same engine, so the asymmetry is worth keeping in
-mind when preparing the two inputs.
+**Identifier contract.** `b1`…`bn` must be exactly the set of `battery_id`
+values the `equipment` table carries with `battery_size_kwh > 0` — compared by
+**set**, never by count, and a mismatch in either direction is an error. `b0`
+must resolve to an MV node, `b1`…`bn` to LV buses.
+
+**Sign convention.** Positive = **charging** (the battery consumes, seen from
+the grid), negative = discharge. This is pandapower's `storage` convention, and
+the *opposite* of the `sgen` convention `pv_profiles` follows, where positive
+means injection. Both live in the same engine, so the asymmetry is worth keeping
+in mind when preparing the two inputs.
+
+**Power ratings.** `b0` uses `config['bss_park_p_kw']`. A domestic battery's
+rating is derived: `battery_size_kwh × bss_c_rate(config)`, where the C-rate
+defaults to `bss_park_p_kw / bss_park_e_kwh` (0.229 C) unless
+`config['bss_c_rate']` sets it. The fleet is then one technology at two scales.
 
 **Feasibility.** Two independent checks warn without rejecting: the
-instantaneous power against `config['bss_park_p_kw']` (`[BSS/schedule]`) and
-the cumulative energy against `config['bss_park_e_kwh']` (`[BSS/soc]`). Both
-are clipped rather than applied as-is when `config['bss_enforce_limits']` is
-set, which is the default.
+instantaneous power against each battery's **own** rating (`[BSS/schedule]`) and
+the cumulative energy against its **own** capacity (`[BSS/soc]`). Both are
+clipped rather than applied as-is when `config['bss_enforce_limits']` is set,
+which is the default — and the clipped series is what reaches the power flow.
 
 ```{warning}
 `schedules_BSS` is in **kW**, while `households` and `pv_profiles` are in
@@ -165,7 +186,7 @@ responsibility**, and the twin cannot check it. A schedule that is both bare
 and time-shifted passes undetected, by construction.
 
 ```{warning}
-This matters more than a typical off-by-one. The aggregate is injected as
+This matters more than a typical off-by-one. Each battery is injected as
 **signed** power, so a temporal offset does **not** degrade gracefully: it
 inverts the battery against the load peak, turning charging into discharging
 at exactly the moments that decide the result. A silently shifted schedule

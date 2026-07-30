@@ -1,41 +1,47 @@
 # BSS modelling
 
-The digital twin simulates a **battery storage system (BSS)** natively:
+The digital twin simulates **battery storage (BSS)** natively:
 [`run_digital_twin`](interfacing.md) accepts a `schedules_BSS` argument and,
-when it is provided, creates a pandapower `storage` element and runs the power
-flow with loads, PV **and** the battery together. When `schedules_BSS` is
-`None`, no storage is created and the behaviour is identical to a run without
-it — the same activation-by-presence rule as `pv_profiles`.
+when it is provided, creates one pandapower `storage` element per battery and
+runs the power flow with loads, PV **and** the batteries together. When
+`schedules_BSS` is `None`, no storage is created and the behaviour is identical
+to a run without it — the same activation-by-presence rule as `pv_profiles`.
 
-## The model: one central park, N contractual shares
+## The model: a fleet of physical batteries
 
 This is the single most important thing to get right before reading anything
 else on this page.
 
-The twin models **one physical battery park connected to an MV node**
-(`config['bss_bus']`, `MALVOZ BRESSOUX` by default), sized by
-`bss_park_e_kwh` and `bss_park_p_kw`. Households do not own batteries in their
-garages: they hold **contractual shares** of that single park. A household with
-a PV surplus exports it onto the LV network and the park absorbs the equivalent
-energy at the MV node.
+The twin models a **fleet**, and every battery in it is a physical object at a
+real point of the grid:
 
-The energy accounting holds; the electrons do not take that path. Two
-consequences worth stating plainly:
+| id | what | where | sized by |
+|---|---|---|---|
+| `b0` | central battery | an MV node, `config['bss_bus']` | `bss_park_e_kwh`, `bss_park_p_kw` |
+| `b1`…`bn` | domestic batteries | one per equipped LV bus | `battery_size_kwh` in the equipment table |
 
-- The park supports the **MV node**, not the LV feeder of the household that
-  owns the share. Do not read a local voltage benefit into the results.
-- `bss_shares.csv` maps `bus_id → e_kwh`, but `bus_id` says *who holds the
-  share*, not *where a battery is installed*.
+A battery exists exactly when the schedule names it. Central-only,
+domestic-only and both are all expressible, and none of them needs a flag.
+
+Domestic batteries take the **central park's C-rate** rather than a power spec
+of their own: `utils.bss_c_rate(config)` returns `bss_park_p_kw /
+bss_park_e_kwh` (0.229 C on the defaults) unless the scenario sets
+`bss_c_rate`, and each battery's rating is `battery_size_kwh × c_rate`. The
+fleet is then one technology at two scales, and re-speccing the park drags the
+homes along instead of silently pairing a fast park with slow batteries.
 
 ```{mermaid}
 flowchart LR
-    G[generate_bss_shares] --> C[(inputs/bss_shares.csv)]
+    N[(inputs/network.py)] --> E[generate_equipment_table]
+    E --> C[(out/processed/equipment.csv)]
     C --> B(build_bss_schedule)
     L[(out/processed/load_profiles.csv)] --> B
     P[pv_profiles] --> B
-    B -->|schedules_BSS, kW| D(process_data)
+    B -->|schedules_BSS, long, kW| D(process_data)
+    C --> D
     D --> T(run_digital_twin)
-    T --> S[storage on config'bss_bus']
+    T --> S0[storage b0 on an MV node]
+    T --> S1[storage b1..bn on their LV buses]
     T --> R[verdict + bss_* metrics]
 ```
 
@@ -47,31 +53,66 @@ supply their own file. It exists so the twin's BSS path can be exercised on a
 realistic input, and so a partner has a worked example of the expected format.
 ```
 
-## 1. Share register — `generate_bss_shares`
+Each battery is scheduled against the signal that fits what it is: `b1`…`bn` are
+behind-the-meter batteries, so a **per-bus** signal is the right one for them —
+a bus with PV goes into surplus at midday, a bus without never does, and
+aggregating first destroys that surplus, since at neighbourhood scale the PV sum
+never exceeds the load sum. `b0` sits on an MV node and gets the **aggregate**
+signal for the same reason. Voltage support therefore happens where the battery
+physically is.
 
-Writes `inputs/bss_shares.csv` (schema in [Data files](data_files.md)). One
-share per LV bus, all of equal energy, `bss_park_e_kwh / n` each. There is no
-share count to configure — it *is* the number of LV buses (333 on Bressoux).
+## 1. Placement — the equipment table
 
-The split is deliberately uniform, not weighted by load or PV: this is a test
-fixture, and a uniform split makes `sum(e_kwh) == bss_park_e_kwh` hold by
-construction, which is exactly the invariant
-`utils.check_bss_energetic_feasibility` verifies. The register is fully
-deterministic — no draw, hence nothing to seed.
+Which buses carry a battery, and how big, is decided in
+[`data_processing.equipment`](data_files.md) and written to
+`out/processed/equipment.csv`, one row per equipable bus. `place_bss` draws
+among the PV-equipped LV buses by default (`batteries_follow_pv`), since a home
+battery is almost always installed alongside a PV system, and assigns
+`battery_id` as `b1`…`bn` in ascending `bus_id` order — deterministic, so the
+same table always yields the same identifiers.
+
+`b0` is deliberately **not** a row of that table: it lives on an MV node and its
+placement and size already have their own config keys.
 
 ## 2. Schedule generation — `build_bss_schedule`
 
-Pure computation, no network and no pandapower. Returns **one kW column per
-share**, on the labelled weekly index so the twin's `[BSS/align]` pre-check can
-actually verify alignment rather than trusting a bare `RangeIndex`.
+Pure computation, no network and no pandapower. Returns the **long format**
+described below, on the labelled weekly index so the twin's `[BSS/align]`
+pre-check can actually verify alignment rather than trusting a bare
+`RangeIndex`.
 
-Each share is scheduled against a net-load signal, `load − PV`, and follows a
-greedy self-consumption plus peak-shaving rule:
+Each battery is scheduled against **its own** net-load signal, `load − PV`, and
+follows a greedy self-consumption plus peak-shaving rule:
 
 - **Charge** when the net load sits in the low quantile of that day
   (`q_charge`, 0.30) — the PV surplus hours and the night valley.
 - **Discharge** when it sits in the high quantile (`q_discharge`, 0.75) — the
   evening peak.
+
+For `b1`…`bn` the signal is **its own bus's** household load minus **its own**
+PV; for `b0` it is the neighbourhood aggregate (the sum of the assigned loads,
+minus all the PV).
+
+```{note}
+A domestic battery is scheduled against the household it sits behind, which
+requires knowing *which* household that is — `metadata['bus_id']`, the declared
+assignment. On Bressoux the 20 schedules then cycle between 11.7 and 43.1
+kWh/week, tracking households that consume between 0.1 and 75.9 kWh/week.
+
+Passing `metadata=None` falls back to the **pool mean**, for a caller that has
+no assignment to declare. Note what that fallback costs: the 20 batteries all
+sit on 3 kWp PV buses, so they receive the same net-load signal and their
+schedules come out bit-identical.
+```
+
+```{warning}
+The quantile rule degenerates on a **near-flat** load. A household consuming
+0.1 kWh over the whole week still has a "low quantile" and a "high quantile", so
+its battery is scheduled to arbitrage between them — 22 kWh/week of cycling for
+a dwelling that consumes almost nothing. Bounded and harmless for the network,
+but meaningless economically; see also the clipping note in
+[Load assignment](load_assignment.md).
+```
 
 Thresholds are **quantiles of each day**, never absolute kW. At this site the
 aggregate net load never goes negative, so an absolute "charge on surplus" rule
@@ -87,72 +128,98 @@ Two properties make the result usable rather than merely plausible:
   `config['bss_eta']` exactly as the engine's SoC tracker does — charging
   stores `p·dt·η`, discharging draws `p·dt/η`, so a full cycle costs `η²`.
   Balancing on meter-side kWh instead ignores the round-trip loss and drains
-  the park a little every day.
+  the battery a little every day.
 
-Each share's power is capped at its own slice of the park rating, proportional
-to its slice of the energy — a share cannot claim more of the inverter than it
-owns of the cells. This is what keeps the summed aggregate within
-`bss_park_p_kw` by construction.
+The SoC walk on top caps power by the room left in the
+`[BSS_SOC_MIN_FRAC, 1.0]` band — the *same* band the engine enforces, imported
+from `utils` rather than restated, so a schedule built here is feasible there.
 
-## 3. Consuming the schedule in the digital twin
+## 3. The `schedules_BSS` format
 
-`process_data` builds `schedules_BSS` from `inputs/bss_shares.csv` and returns
-it as the fifth element of its tuple; `main.py` passes it straight through.
-Inside the engine the path is:
+**Long**: the index is the time steps repeated once per battery, and there are
+exactly two columns.
 
-1. `_read_bss_schedule` — sums the N columns into one aggregate park series,
-   converts kW → MW (the only such conversion point), and checks the
-   instantaneous power against `bss_park_p_kw`.
-2. `_inject_bss_storage` — creates the single `storage` element on
-   `config['bss_bus']`.
-3. `_track_bss_soc` — integrates the state of charge step by step, since
-   pandapower does not update `soc_percent` during a time-series run.
-4. `_run_powerflow` — drives the storage through a `ConstControl`, exactly as
+| index | `battery_id` | `p_kw` |
+|---|---|---|
+| `Mon 00:00` | `b0` | `+142.7` |
+| `Mon 00:15` | `b0` | `+138.2` |
+| … | … | … |
+| `Mon 00:00` | `b1` | `+1.4` |
+
+The identifier column is what makes the format **checkable**: a declared
+`b0`…`bn` can be matched against the equipment table and the network, where the
+free-named column of a wide frame carries no such meaning. That check is what
+lets each battery keep its own storage element, bus and state of charge instead
+of being summed into a single aggregate.
+
+Two contracts are enforced in `_validate_inputs`, both as **errors**:
+
+- **Identifiers.** `b1`…`bn` in the schedule must be exactly the set of
+  `battery_id` values the equipment table carries with `battery_size_kwh > 0`.
+  Compared by **set**, never by count: "20 batteries scheduled for 20 equipped
+  buses" can match by construction while designating different batteries. Both
+  directions are reported, because they mean opposite things — a schedule for a
+  battery nobody installed, or an installed battery nobody scheduled.
+- **Bus ids.** `b1`…`bn` must land in `BUS_DOMAIN_LV`, `b0` in
+  `BUS_DOMAIN_MV_NODE`. A domestic battery on an MV node is a placement error,
+  and the central one has no LV bus to sit on.
+
+## 4. Consuming the schedule in the digital twin
+
+`process_data` builds `schedules_BSS` and returns it with the equipment table;
+`main.py` passes both straight through. Inside the engine the path is:
+
+1. `_bss_fleet_specs` — resolves the fleet once: each battery's bus, capacity
+   and power rating. The contract check, the injection and the SoC tracking all
+   read this one dict rather than re-deriving placement three times.
+2. `_read_bss_schedule` — pivots long → wide, converts kW → MW (the only such
+   conversion point), and checks each battery's instantaneous power against
+   **its own** rating.
+3. `_track_bss_soc` — integrates each state of charge separately, since
+   pandapower does not update `soc_percent` during a time-series run. Per
+   battery rather than fleet-wide because the capacities differ by two orders of
+   magnitude: a fleet-level SoC would let the park's headroom mask a domestic
+   battery driven flat.
+4. `_inject_bss_storage` — creates one `storage` element per battery, on its own
+   bus, `b0` and `b1`…`bn` through the same loop.
+5. `_run_powerflow` — drives each storage through a `ConstControl`, exactly as
    the PV `sgen` elements are driven.
+
+The series that reaches the power flow is the one `_track_bss_soc` returns, not
+the raw schedule — otherwise `bss_enforce_limits` would only ever produce a
+warning while the infeasible schedule ran anyway.
 
 Sign, unit and feasibility conventions are documented once, in
 [Interfacing](interfacing.md#the-schedules_bss-input). The short version:
 **kW at the interface, positive = charging**, which is the opposite of the
 `sgen` convention `pv_profiles` follows.
 
-## A known modelling tension
+## Reported metrics
 
-Worth stating because it affects how the results should be read, and because it
-is not settled.
+The run verdict carries the fleet **aggregate**: `bss_n_batteries`,
+`bss_n_domestic`, `bss_e_installed_kwh`, `bss_p_agg_max_kw` /
+`bss_p_agg_min_kw` (signed, so max > 0 is the strongest charge), and
+`bss_soc_min_pct` / `bss_soc_max_pct` across the whole fleet.
 
-The park is **one MV-connected asset**, so physically it only ever sees
-aggregate flows at its connection point. The generator above, however, builds
-its signal **per bus**: a bus carrying PV goes into surplus at midday, a bus
-without PV never does. Those per-bus signals are then summed.
-
-That choice was made because aggregating first destroys the surplus: at
-neighbourhood scale the PV sum never exceeds the load sum, so a schedule built
-from the aggregate net load would never see one. Per-share, a PV-equipped
-household genuinely does.
-
-The tension is that per-bus signals are strictly meaningful only for storage
-sitting *behind each meter* — which is not the model. For a central park, the
-coherent signal would be aggregate on both sides. The two readings cannot be
-served by the same calculation, and the current code takes the per-bus one.
-
-One visible consequence: only 30 of the 333 Bressoux LV buses carry PV, so 303
-shares schedule with no PV term at all and their "charge in the night valley"
-shape dominates the park aggregate. The midday charging window is faint. That
-is the neighbourhood's real 9% PV penetration showing through, not a defect —
-but it does mean the aggregate profile looks close to a plain night-charge /
-evening-discharge schedule.
+Per-battery state of charge is opt-in through `config['export_bss_soc']`, which
+appends `category == 'bss_soc'` rows (one per battery per timestep). Off by
+default because that is `n_batteries × n_timesteps` rows on every run.
 
 ## Generating the input file
 
+The fleet comes from the equipment table, so there is no separate register to
+generate any more:
+
 ```bash
-python -c "from digital_twin.data_processing.bss import generate_bss_shares; generate_bss_shares({'data_path': 'data/bressoux'})"
+python -c "from digital_twin.data_processing.equipment import generate_equipment_table; generate_equipment_table({'data_path': 'data/bressoux'})"
 ```
 
-Writes `inputs/bss_shares.csv`. Only needed to generate a *new* register; the
-one already in `inputs/` is used as-is otherwise.
+`process_data` then builds the schedule from that table on every call.
 
 ## Visual check
 
-`scripts/viz/plot_bss_profiles.py` draws the week (load, PV, park, net), the
-park power against its state of charge, and the daily profiles superimposed —
-without running any power flow. Run it from the repository root.
+`scripts/viz/plot_bss_profiles.py` draws the week (load, PV, fleet, net), the
+fleet power against its capacity-weighted state of charge, and the daily
+profiles superimposed — without running any power flow. The fleet is aggregated
+*for the figure only*; those curves answer "what does the transformer see". Run
+it from the repository root.

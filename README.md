@@ -10,10 +10,10 @@ profiles and PV production and a battery schedule as arguments
 (voltages, loadings, violations). This is what makes it reusable for a
 different LV network without touching `digital_twin/`.
 
-The battery layer models **one centralised storage park on an MV node**, not
-distributed household batteries: households hold contractual *shares* of that
-single park. See the *Interfacing* page of the documentation for the schedule
-format and its conventions.
+The battery layer models a **fleet of physical batteries**: `b0`, a central
+battery on an MV node, and `b1..bn`, one domestic battery per equipped LV bus,
+each injected as its own storage element on its own bus. See the *Interfacing*
+page of the documentation for the schedule format and its conventions.
 
 ## Using it as a dependency
 
@@ -76,18 +76,17 @@ data/bressoux/
                                 # loaded dynamically by digital_twin.utils.load_site_network
     coordinates.csv             # building coordinates (read by network.py)
     part-*.csv                  # raw smart-meter readings (anonymised EAN)
-    pv_installations.csv        # OPTIONAL -- PV installation register (bus_id, kwp, type, street);
-                                # a scenario opts into PV simply by having this file
-    bss_shares.csv              # OPTIONAL -- BSS contractual share register (bus_id, e_kwh, street);
-                                # a scenario opts into the battery simply by having this file
   out/
     processed/                # DERIVED data, regenerated from inputs/ by the site's
                                 # data pipeline (e.g. bressoux_setup.ipynb):
+      equipment.csv                # bus-level equipment register -- one row per equipable bus,
+                                    # carrying PV sizes and domestic battery ids/capacities.
+                                    # Its CONTENT is what switches the PV and BSS layers on
       metadata.csv                 # per-household attributes (profile_id, source_street, ...)
       load_profiles.csv            # household consumption timeseries -- the `households` argument
       mv_load_profiles.csv         # the MV load facility profiles
       pvgis_irradiance_quarter_hourly.parquet   # cached PVGIS irradiance, needed alongside
-                                                 # pv_installations.csv to build `pv_profiles`
+                                                 # equipment.csv to build `pv_profiles`
     results/                   # run reports (see save_run_report below)
   bressoux_setup.ipynb      # notebook that builds inputs/ -> out/processed/
 ```
@@ -128,22 +127,22 @@ generated file.
    python main.py
    ```
 
-   If `inputs/pv_installations.csv` exists, PV production is built and
-   injected automatically -- nothing else to configure. Same rule for the
-   battery: if `inputs/bss_shares.csv` exists, the park schedule is built from
-   it and injected as a storage element, and the run report gains the `bss_*`
-   metrics (bus, state of charge, energy charged/discharged). Either file
-   missing simply means that layer is off. `config['save']` (already `True` in
-   `main.py`) writes a Markdown run report (summary/violations/warnings) to
-   `out/results/`.
+   Both optional layers switch on from the CONTENT of
+   `out/processed/equipment.csv`: a bus with `pv_system_size_kwp > 0` gives PV
+   production, a bus with `battery_size_kwh > 0` gives a domestic battery. The
+   battery fleet (`b0` central on an MV node, `b1..bn` domestic on their own LV
+   buses) is injected as one storage element each, and the run report gains the
+   `bss_*` metrics. An empty column simply means that layer is off.
+   `config['save']` (already `True` in `main.py`) writes a Markdown run report
+   (summary/violations/warnings) to `out/results/`.
 
 The steps below are only needed for the separate monthly-bank / PV
 impact-analysis tooling (`scripts/pv_impact_analysis.py`), not for the basic
 `main.py` run above:
 
 3. **Consumption bank** (every complete real calendar week from the meter
-   data, tagged by month/season/street -- an alternative, month-conditioned
-   source of `households`):
+   data, tagged by month/season/street -- the month-conditioned source the
+   `households` draw reads from):
 
    ```bash
    python -m digital_twin.data_processing.profiles
@@ -152,43 +151,34 @@ impact-analysis tooling (`scripts/pv_impact_analysis.py`), not for the basic
    Writes `out/processed/consumption_bank_real_weeks.parquet` (the PVGIS
    irradiance reference is already written by step 1).
 
-4. **PV installation register** (which buses carry PV, and their size --
-   only needed to generate a *new* `pv_installations.csv`; the one already in
-   `inputs/` is used as-is otherwise):
+4. **Equipment register** (which buses carry PV and/or a domestic battery, and
+   how big -- one file for both layers, derived from the network):
 
    ```bash
-   python -m digital_twin.data_processing.pv
+   python -c "from digital_twin.data_processing.equipment import generate_equipment_table; generate_equipment_table({'data_path': 'data/bressoux'})"
    ```
 
-   Writes `inputs/pv_installations.csv`.
-
-5. **BSS share register** (which buses hold a share of the central park, and
-   how much energy each -- only needed to generate a *new* `bss_shares.csv`;
-   the one already in `inputs/` is used as-is otherwise):
-
-   ```bash
-   python -c "from digital_twin.data_processing.bss import generate_bss_shares; generate_bss_shares({'data_path': 'data/bressoux'})"
-   ```
-
-   Writes `inputs/bss_shares.csv` -- one share per LV bus, of equal energy,
-   summing to `config['bss_park_e_kwh']`.
+   Writes `out/processed/equipment.csv` -- one row per equipable bus, equipped
+   or not. Regenerate it rather than hand-editing it: it is derived data, and
+   its exhaustiveness is what lets the twin check bus ids by set comparison
+   instead of by row count.
 
 Once the generated files exist, only step 2 needs to be repeated for
-day-to-day runs; steps 1 and 3 to 5 are one-off (re-run them only if the
+day-to-day runs; steps 1, 3 and 4 are one-off (re-run them only if the
 sources change).
 
 ## Repository layout
 
 - `digital_twin/` — the network-agnostic engine (`digital_twin.py`,
   `run_digital_twin`, `save_run_report`), shared helpers (`utils.py`), and the
-  upstream data generators (`data_processing/profiles.py`,
-  `data_processing/pv.py`, `data_processing/bss.py`,
-  `data_processing/process_data.py`).
+  upstream data generators (`data_processing/equipment.py`,
+  `data_processing/profiles.py`, `data_processing/pv.py`,
+  `data_processing/bss.py`, `data_processing/process_data.py`).
 - `data/<site>/inputs/network.py` — the site-specific topology builder (NOT
   part of the installable package — this is what a new site replaces).
 - `main.py` — orchestration/demo: load a scenario's inputs, then run the twin.
-- `scripts/` — impact analysis and figures (run from `scripts/`, not from the
-  repository root).
+- `scripts/` — impact analysis and figures (run from the repository root: their
+  data paths are repo-root relative).
 - `docs/` — Sphinx documentation.
 - `archives/` — superseded scripts, and one-off checks whose proof is done,
   kept for reference (see `archives/README.md`).
