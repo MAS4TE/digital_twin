@@ -1,15 +1,22 @@
 """
-Volet PV -- Brique 4 : analyse d'impact (surtensions / flux inverses).
+PV impact analysis: overvoltages and reverse flows.
 
-Compare plusieurs taux de pénétration PV (0 / 30 / 50 / 80 installations) sur
-un mois d'été, cible le PIRE INSTANT (pas une moyenne journalière), puis
-refait la même comparaison (0/30/50, pas 80) sur un mois d'hiver comme
-contrôle de complétude (confirmer l'absence de surtension hivernale).
+Compares several PV penetration rates (0 / 30 / 50 / 80 installations) over a
+summer month, targeting the WORST INSTANT rather than a daily average, then
+repeats the comparison (0/30/50, no 80) over a winter month as a completeness
+control confirming the absence of winter overvoltage.
 
-S'appuie sur l'architecture réseau de base + deepcopy de la brique 3
-(`digital_twin.data_processing.pv.build_base_network` / `run_pv_scenario`).
-Le garde-fou d'alignement temporel (`digital_twin.digital_twin._verify_temporal_alignment`)
-reste appelé à l'intérieur de `run_pv_scenario()` avant chaque power flow.
+Built on the base-network + deepcopy architecture
+(`digital_twin.data_processing.pv.build_base_network` / `run_pv_scenario`). The
+temporal alignment guardrail
+(`digital_twin.digital_twin._verify_temporal_alignment`) is called inside
+`run_pv_scenario()` before each power flow.
+
+The PV fleets are NESTED EQUIPMENT TABLES built here by `equipment.extend_pv`:
+the 50-fleet contains the 30-fleet, the 80 contains the 50. That is what isolates
+the effect of the penetration RATE from the effect of PLACEMENT -- an independent
+draw per rate would mix the two and make the deltas uninterpretable. Building
+them on the fly also removes the risk of stale CSVs.
 
 This script only RUNS the scenarios; the metrics/figures are produced by
 scripts/viz/plot_pv_impact_analysis.py (analyze / build_summary_table /
@@ -21,8 +28,12 @@ import time
 
 import pandas as pd
 
-from digital_twin.data_processing.pv import build_base_network, run_pv_scenario, verify_bus_ids
-from digital_twin.utils import STEPS_PER_DAY
+from digital_twin.data_processing.equipment import (
+    build_equipment_skeleton, extend_pv, generate_equipment_table,
+)
+from digital_twin.data_processing.pv import build_base_network, run_pv_scenario
+from digital_twin.utils import (BUS_DOMAIN_EQUIPABLE, STEPS_PER_DAY, check_bus_ids,
+                                irradiance_path_for)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from viz.plot_pv_impact_analysis import (
@@ -30,30 +41,41 @@ from viz.plot_pv_impact_analysis import (
     plot_overvoltage_map, plot_voltage_max_profile,
 )
 
+DATA_PATH = "data/bressoux"
 OUT_DIR = "outputs_pv_impact"
+
+# Site-calibrated placement, as in main.py -- these describe Bressoux, not the
+# engine, so they travel with the scenario.
+SCENARIO = {
+    "data_path": DATA_PATH,
+    "street_weights": {"Rue Ernest Malvoz": 3.0},
+    "mv_pv_installations": {"Paradis du Bouhay": 12.0},
+}
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-metadata = pd.read_csv("data/bressoux/out/processed/metadata.csv")
-irradiance = pd.read_parquet("data/bressoux/out/processed/pvgis_irradiance_quarter_hourly.parquet")
+metadata = pd.read_csv(f"{DATA_PATH}/out/processed/metadata.csv")
+irradiance = pd.read_parquet(irradiance_path_for(DATA_PATH))
 
-pv_0 = pd.DataFrame(columns=["bus_id", "kwp", "type", "street"])
-pv_30 = pd.read_csv("data/bressoux/inputs/pv_installations.csv")
-pv_50 = pd.read_csv("data/bressoux/inputs/pv_installations_50.csv")
-pv_80 = pd.read_csv("data/bressoux/inputs/pv_installations_80.csv")
+print("=== Building the base network (once) ===")
+t0 = time.time()
+network = build_base_network(SCENARIO)
+print(f"network built in {time.time() - t0:.1f}s")
+
+# Nested fleets: 0 c 30 c 50 c 80.
+pv_0 = build_equipment_skeleton(network)                  # no installation
+pv_30 = generate_equipment_table(SCENARIO, write=False)   # the scenario's own fleet
+pv_50 = extend_pv(pv_30.copy(), 20, SCENARIO)
+pv_80 = extend_pv(pv_50.copy(), 30, SCENARIO)
 
 SUMMER_CONFIGS = [("0 PV", pv_0), ("30 PV", pv_30), ("50 PV", pv_50), ("80 PV", pv_80)]
 WINTER_CONFIGS = [("0 PV", pv_0), ("30 PV", pv_30), ("50 PV", pv_50)]
 
-print("=== Construction du reseau de base (une fois) ===")
-t0 = time.time()
-network = build_base_network()
-print(f"network construit en {time.time() - t0:.1f}s")
-
 bus_to_street = {b: s for (s, num), b in network["buses"].items()}
-for _, pv in [("30", pv_30), ("50", pv_50), ("80", pv_80)]:
-    verify_bus_ids(pv, network)
-print("bus_id des 3 parcs PV (30/50/80) verifies contre le reseau reel : OK")
+for label, table in SUMMER_CONFIGS[1:]:
+    equipped = table[table["pv_system_size_kwp"].fillna(0.0) > 0]
+    check_bus_ids(equipped["bus_id"], network, BUS_DOMAIN_EQUIPABLE, f"{label} fleet")
+    print(f"  {label:<6} : {len(equipped)} installation(s), bus_ids checked")
 
 
 def run_all(configs, mois):
@@ -67,38 +89,38 @@ def run_all(configs, mois):
     return out
 
 
-print("\n=== Scenarios ETE (juin) : 0 / 30 / 50 / 80 PV ===")
+print("\n=== SUMMER scenarios (June): 0 / 30 / 50 / 80 PV ===")
 summer = run_all(SUMMER_CONFIGS, "juin")
 
-print("\n=== Scenarios HIVER (janvier) : 0 / 30 / 50 PV (controle de completude) ===")
+print("\n=== WINTER scenarios (January): 0 / 30 / 50 PV (completeness control) ===")
 winter = run_all(WINTER_CONFIGS, "janvier")
 
 
 print("\n" + "=" * 70)
-print("ANALYSE -- ETE")
+print("ANALYSIS -- SUMMER")
 print("=" * 70)
 summer_metrics = {label: analyze(res, label, "juin", bus_to_street, STEPS_PER_DAY) for label, res in summer.items()}
 
 print("\n" + "=" * 70)
-print("ANALYSE -- HIVER (controle de completude)")
+print("ANALYSIS -- WINTER (completeness control)")
 print("=" * 70)
 winter_metrics = {label: analyze(res, label, "janvier", bus_to_street, STEPS_PER_DAY) for label, res in winter.items()}
 
 print("\n" + "=" * 70)
-print("TABLEAU COMPARATIF -- ETE")
+print("COMPARISON TABLE -- SUMMER")
 print("=" * 70)
 summary_df = build_summary_table(summer_metrics, ["0 PV", "30 PV", "50 PV", "80 PV"],
                                   out_csv=os.path.join(OUT_DIR, "summary_summer.csv"))
 
 v0 = summer_metrics["0 PV"]["v_max"]
-print("\nDelta tension max vs 0 PV :")
+print("\nMax voltage delta vs 0 PV:")
 for label in ["30 PV", "50 PV", "80 PV"]:
     m = summer_metrics[label]
     print(f"  {label}: {m['v_max']:.4f} pu ({(m['v_max'] - v0) * 1000:+.1f} milli-pu vs 0 PV), "
           f"{m['n_over_low']} violation(s) > 1.05 pu")
 
 print("\n" + "=" * 70)
-print("TABLEAU COMPARATIF -- HIVER (controle)")
+print("COMPARISON TABLE -- WINTER (control)")
 print("=" * 70)
 build_summary_table(winter_metrics, ["0 PV", "30 PV", "50 PV"],
                     out_csv=os.path.join(OUT_DIR, "summary_winter.csv"))

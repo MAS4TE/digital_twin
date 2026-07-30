@@ -20,8 +20,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-V_LOW = 1.05   # seuil EN 50160 (usage courant)
-V_HIGH = 1.10  # seuil EN 50160 (tolerance limitee, ex court, 5% du temps)
+V_LOW = 1.05   # EN 50160 threshold (normal operation)
+V_HIGH = 1.10  # EN 50160 threshold (limited tolerance, up to 5% of the time)
 
 plt.rcParams.update({
     "font.family": "serif", "font.size": 13,
@@ -54,7 +54,7 @@ def analyze(res, label, mois, bus_to_street, steps_per_day):
     n_over_low = int((vm_worst > V_LOW).sum())
     n_over_high = int((vm_worst > V_HIGH).sum())
     over_buses = vm_worst[vm_worst > V_LOW].sort_values(ascending=False)
-    over_streets = pd.Series({b: bus_to_street.get(int(b), "MV/autre") for b in over_buses.index})
+    over_streets = pd.Series({b: bus_to_street.get(int(b), "MV/other") for b in over_buses.index})
 
     ext_grid_p = res["ext_grid_p"].iloc[worst_step]
     ext_grid_val = float(ext_grid_p.iloc[0]) if hasattr(ext_grid_p, "iloc") else float(ext_grid_p)
@@ -64,16 +64,16 @@ def analyze(res, label, mois, bus_to_street, steps_per_day):
     max_trafo_loading = float(res["trafo_load"].iloc[worst_step].max())
 
     print(f"\n--- {mois} / {label} ---")
-    print(f"  Pire instant : pas {worst_step} (jour {worst_day}, ~{worst_hour:02d}h{worst_min:02d} UTC)")
-    print(f"  Tension max reseau : {per_step_max.max():.4f} pu")
-    print(f"  Bus > {V_LOW} pu : {n_over_low} ; bus > {V_HIGH} pu : {n_over_high}")
+    print(f"  Worst instant: step {worst_step} (day {worst_day}, ~{worst_hour:02d}:{worst_min:02d} UTC)")
+    print(f"  Max network voltage: {per_step_max.max():.4f} pu")
+    print(f"  Buses > {V_LOW} pu: {n_over_low}; buses > {V_HIGH} pu: {n_over_high}")
     if len(over_buses) > 0:
-        print(f"  Rues concernees : {over_streets.value_counts().to_dict()}")
-    print(f"  ext_grid p_mw au pire instant : {ext_grid_val:.4f} MW "
-          f"{'(EXPORT / flux inverse vers l amont)' if ext_grid_val < 0 else '(import normal)'}")
-    print(f"  Trafo en flux inverse (p_hv_mw<0) : {len(reverse_trafos)}/{len(trafo_p_hv)}"
+        print(f"  Streets affected: {over_streets.value_counts().to_dict()}")
+    print(f"  ext_grid p_mw at the worst instant: {ext_grid_val:.4f} MW "
+          f"{'(EXPORT / reverse flow upstream)' if ext_grid_val < 0 else '(normal import)'}")
+    print(f"  Transformers in reverse flow (p_hv_mw<0): {len(reverse_trafos)}/{len(trafo_p_hv)}"
           + (f" -- {reverse_trafos.round(4).to_dict()}" if len(reverse_trafos) else ""))
-    print(f"  Charge ligne max : {max_line_loading:.1f}% ; charge trafo max : {max_trafo_loading:.1f}%")
+    print(f"  Max line loading: {max_line_loading:.1f}%; max trafo loading: {max_trafo_loading:.1f}%")
 
     return {
         "mois": mois, "config": label, "worst_step": worst_step,
@@ -114,25 +114,30 @@ def plot_voltage_max_profile(summer, summer_metrics, steps_per_day, out_dir, ref
         day_vals = res["vm"].max(axis=1).to_numpy()[worst_day_ref * steps_per_day:(worst_day_ref + 1) * steps_per_day]
         ax.plot(t, day_vals, color=colors.get(label, "#888888"), lw=2.0,
                 label=f"{label} (max={day_vals.max():.4f} pu)")
-    ax.axhline(V_LOW, color="black", linestyle="--", linewidth=1, label=f"Seuil {V_LOW} pu (EN 50160)")
+    ax.axhline(V_LOW, color="black", linestyle="--", linewidth=1, label=f"{V_LOW} pu threshold (EN 50160)")
     ax.set_xlim(0, 24)
     ax.set_xticks(np.arange(0, 25, 4))
-    ax.set_xticklabels([f"{h:02d}h" for h in range(0, 25, 4)])
-    ax.set_xlabel("Heure de la journée (UTC)")
-    ax.set_ylabel("Tension max sur le réseau [pu]")
-    ax.set_title("Tension maximale — 0 / 30 / 50 / 80 installations PV (été)", loc="left", fontsize=13)
+    ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 25, 4)])
+    ax.set_xlabel("Hour of day (UTC)")
+    ax.set_ylabel("Max network voltage [pu]")
+    ax.set_title("Maximum voltage — 0 / 30 / 50 / 80 PV installations (summer)", loc="left", fontsize=13)
     ax.legend(frameon=True, fontsize=10)
     fig.tight_layout()
     out_path = os.path.join(out_dir, "voltage_max_profile_summer.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"\nFigure ecrite : {out_path}")
+    print(f"\nFigure written: {out_path}")
 
 
-def plot_overvoltage_map(coords, res_bus_ids, summer_metrics, pv_installations, out_dir, ref_label="50 PV"):
-    """Figure 2: map of buses in overvoltage at the worst instant (ref_label scenario)."""
+def plot_overvoltage_map(coords, res_bus_ids, summer_metrics, equipment, out_dir, ref_label="50 PV"):
+    """Figure 2: map of buses in overvoltage at the worst instant (ref_label scenario).
+
+    `equipment` is the scenario's equipment table: every equipable bus is a row,
+    so the PV buses are the rows with a non-zero size, not the whole frame.
+    """
     vm_worst = summer_metrics[ref_label]["vm_worst"]
-    pv_bus_ids = set(int(b) for b in pv_installations["bus_id"])
+    equipped = equipment[equipment["pv_system_size_kwp"].fillna(0.0) > 0]
+    pv_bus_ids = set(int(b) for b in equipped["bus_id"])
 
     xs = [coords[int(b)][0] for b in res_bus_ids]
     ys = [coords[int(b)][1] for b in res_bus_ids]
@@ -141,26 +146,27 @@ def plot_overvoltage_map(coords, res_bus_ids, summer_metrics, pv_installations, 
     fig, ax = plt.subplots(figsize=(10, 10))
     sc = ax.scatter(xs, ys, c=vals, cmap="RdYlGn_r", vmin=0.98, vmax=1.08, s=45, zorder=1)
     cbar = fig.colorbar(sc, ax=ax, shrink=0.7)
-    cbar.set_label("Tension [pu]")
+    cbar.set_label("Voltage [pu]")
 
     over_ids = [int(b) for b in res_bus_ids if float(vm_worst.get(b, np.nan)) > V_LOW]
     over_xs = [coords[b][0] for b in over_ids]
     over_ys = [coords[b][1] for b in over_ids]
     ax.scatter(over_xs, over_ys, facecolors="none", edgecolors="red", linewidths=2.0, s=140,
-               label=f"> {V_LOW} pu ({len(over_ids)} bus)", zorder=2)
+               label=f"> {V_LOW} pu ({len(over_ids)} buses)", zorder=2)
 
     pv_xs = [coords[b][0] for b in res_bus_ids if int(b) in pv_bus_ids]
     pv_ys = [coords[b][1] for b in res_bus_ids if int(b) in pv_bus_ids]
     ax.scatter(pv_xs, pv_ys, marker="+", color="black", s=60, linewidths=1.2,
-               label=f"Installation PV ({ref_label})", zorder=3)
+               label=f"PV installation ({ref_label})", zorder=3)
 
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title(f"Tension au pire instant ({ref_label}, été) — surtensions vs clusters PV", loc="left", fontsize=13)
+    ax.set_title(f"Voltage at the worst instant ({ref_label}, summer) — overvoltages vs PV clusters",
+                 loc="left", fontsize=13)
     ax.legend(frameon=True, fontsize=10, loc="upper left")
     ax.set_aspect("equal")
     fig.tight_layout()
     out_path = os.path.join(out_dir, "overvoltage_map_worst_instant.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Figure ecrite : {out_path}")
+    print(f"Figure written: {out_path}")

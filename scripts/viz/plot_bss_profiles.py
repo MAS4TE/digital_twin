@@ -1,30 +1,36 @@
 """
-Volet BSS -- controle visuel des profils du parc de batteries.
+BSS: visual check of the battery fleet profiles.
 
-Trois figures, sans aucun power flow : tout est reconstruit depuis process_data
-(charges, PV, planning BSS) et _track_bss_soc. Compter quelques secondes, pas
-les ~3 min d'un run complet.
+Three figures, no power flow: everything is rebuilt from process_data (loads, PV,
+BSS schedule) and _track_bss_soc, which takes seconds rather than the ~3 min of a
+full run.
 
-    1. Semaine complete   : charge reseau, PV, parc BSS, net vu du transformateur
-    2. Parc BSS + SoC     : deux panneaux empilés (jamais deux axes y superposés)
-    3. Profil journalier  : les 7 jours superposés + la médiane, charge et parc
+    1. Full week      : network load, PV, BSS fleet, net seen from the transformer
+    2. BSS fleet + SoC: two stacked panels (never two superposed y axes)
+    3. Daily profile  : the 7 days overlaid + the median, load and fleet
 
-Pourquoi les internes plutot que `out` : run_digital_twin ne retourne que des
-scalaires (summary), les violations et les warnings -- les series temporelles
-calculees dans _run_powerflow sont consommees par _evaluate puis perdues. Les
-quatre autres scripts de scripts/viz/ contournent de la meme facon.
+The fleet (central b0 + domestic b1..bn) is AGGREGATED here: these curves answer
+"what does the transformer see". Per-battery detail belongs on a network map, not
+on one more time series.
 
-Script de controle, hors pipeline de production : lecture seule, n'ecrit qu'un PNG.
+Why the engine internals rather than `out`: run_digital_twin returns only scalars
+(summary), violations and warnings -- the time series computed in _run_powerflow
+are consumed by _evaluate and then dropped. The other scripts/viz/ scripts reach
+in the same way.
+
+Check script, outside the production pipeline: read-only, writes a single PNG.
 """
 import os
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # backend sur (savefig fiable, cf. soucis machine recurrents)
+matplotlib.use("Agg")  # headless backend, so savefig does not depend on a display
 import matplotlib.pyplot as plt
 
 from digital_twin.data_processing.process_data import process_data
-from digital_twin.digital_twin import _BSS_KW_TO_MW, _assign_loads, _track_bss_soc
+from digital_twin.digital_twin import (_BSS_KW_TO_MW, _assign_loads, _bss_battery_ids,
+                                       _bss_fleet_specs, _bss_storage_name,
+                                       _read_bss_schedule, _track_bss_soc)
 from digital_twin.utils import STEPS_PER_DAY, STEPS_PER_WEEK, _config_to_dict
 
 OUT_PATH = "scripts/viz/bss_profiles.png"
@@ -37,7 +43,7 @@ CONFIG = {
     'seed': 42,
 }
 
-DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 plt.rcParams.update({
     "font.family": "serif",
@@ -48,33 +54,33 @@ plt.rcParams.update({
     "grid.alpha": 0.25,
 })
 
-# Slots 1-3 de la palette categorielle de reference, dans l'ordre. Valides
-# (portage Python du validateur de la skill dataviz, node indisponible ici) :
-# toutes paires, mode clair, surface blanche -> CVD dE 9.2 (>=8), vision normale
-# dE 24.0 (>=15). L'aqua est a 2.82:1 sur blanc, sous le seuil de 3:1 : la regle
-# de relief s'applique, d'ou les etiquettes directes en bout de courbe.
-C_LOAD = "#2a78d6"   # slot 1, bleu
+# Slots 1-3 of the reference categorical palette, in order. Validated: all pairs,
+# light mode, white surface -> CVD dE 9.2 (>=8), normal vision dE 24.0 (>=15).
+# The aqua sits at 2.82:1 on white, under the 3:1 threshold, so the relief rule
+# applies -- hence the direct labels on the curves.
+C_LOAD = "#2a78d6"   # slot 1, blue
 C_PV = "#eb6834"     # slot 2, orange
 C_BSS = "#1baf7a"    # slot 3, aqua
-INK = "#0b0b0b"      # encre primaire -- le net est une resultante, pas une categorie
-MUTED = "#898781"    # axes / etiquettes
+INK = "#0b0b0b"      # primary ink -- the net is a resultant, not a category
+MUTED = "#898781"    # axes / labels
 GRID = "#e1e0d9"
 
 
 def load_series():
-    """Toutes les series en kW, sur 672 pas, alignees positionnellement.
+    """All series in kW, over 672 steps, positionally aligned.
 
-    La charge vient de _assign_loads et NON de households.sum() : households est
-    le POOL de profils (333 colonnes, 48-110 kW), pas la charge du reseau. Le
-    tirage profil -> bus et les 4 charges MV n'existent qu'apres l'affectation,
-    d'ou les ~199 kW de pointe reelle.
+    The load comes from _assign_loads and NOT from households.sum(): households
+    is the POOL of profiles (333 columns, 48-110 kW), not the network load. The
+    profile -> bus assignment and the 4 MV loads only exist after assignment,
+    hence the ~199 kW real peak.
     """
     cfg = _config_to_dict(CONFIG)
-    metadata, network, households, pv_profiles, schedules_BSS = process_data(CONFIG)
+    metadata, network, households, pv_profiles, schedules_BSS, equipment = process_data(CONFIG)
     if schedules_BSS is None:
         raise SystemExit(
-            "Pas de schedules_BSS pour ce scenario : generer inputs/bss_shares.csv "
-            "via digital_twin.data_processing.bss.generate_bss_shares d'abord."
+            "No schedules_BSS for this scenario: the equipment table "
+            "(out/processed/equipment.csv) carries no domestic battery. Generate it "
+            "via digital_twin.data_processing.equipment.generate_equipment_table first."
         )
 
     df_p, _, _, _ = _assign_loads(network, metadata, households, cfg)
@@ -82,25 +88,38 @@ def load_series():
     pv_kw = (pv_profiles.sum(axis=1).to_numpy() * 1000.0
              if pv_profiles is not None else np.zeros_like(load_kw))
 
-    # SoC et serie REELLEMENT appliquee : _track_bss_soc peut ecreter, et c'est
-    # la version ecretee que le twin injecte. Tracer le planning brut donnerait
-    # une figure que le power flow ne verrait jamais.
-    bss_raw_mw = schedules_BSS.sum(axis=1).to_numpy() * _BSS_KW_TO_MW
-    soc, p_applied_mw, _ = _track_bss_soc(bss_raw_mw, cfg)
-    bss_kw = p_applied_mw / _BSS_KW_TO_MW
+    # The fleet is aggregated FOR THE FIGURE only; the twin injects one battery
+    # per bus. These curves answer "what does the transformer see", and the sum
+    # is the right answer to that question.
+    specs = _bss_fleet_specs(cfg, network, equipment, _bss_battery_ids(schedules_BSS))
+    df_bss_p, _ = _read_bss_schedule(schedules_BSS, df_p, cfg, specs,
+                                     load_time_index=households.index)
 
-    # Signe : BSS positif = charge = consommation, donc il S'AJOUTE au net,
-    # la ou le PV se retranche (cf. _inject_bss_storage).
+    # SoC and the series ACTUALLY applied: _track_bss_soc can clip, and the
+    # clipped version is what the twin injects. Plotting the raw schedule would
+    # show a figure the power flow never sees.
+    df_soc, df_applied, _ = _track_bss_soc(df_bss_p, specs, cfg)
+    bss_kw = df_applied.sum(axis=1).to_numpy() / _BSS_KW_TO_MW
+
+    # Fleet SoC = total stored energy / total capacity, hence weighted by the
+    # capacities. A plain mean would give a 10 kWh battery the same weight as
+    # the 2600 kWh park.
+    caps = np.array([specs[b]['e_kwh'] for b in specs], dtype=float)
+    order = [_bss_storage_name(b) for b in specs]
+    soc = (df_soc[order].to_numpy() * caps).sum(axis=1) / caps.sum()
+
+    # Sign: positive BSS = charging = consumption, so it ADDS to the net where
+    # PV subtracts from it (see _inject_bss_storage).
     net_kw = load_kw - pv_kw + bss_kw
     return load_kw, pv_kw, bss_kw, net_kw, soc * 100.0
 
 
 def _label_peak(ax, y, text, color):
-    """Etiquette directe posee sur le maximum de la courbe.
+    """Direct label placed on the curve's maximum.
 
-    Pas en bout de courbe : les quatre series y convergent vers 0 le dimanche
-    soir et les etiquettes se chevauchaient. Sur le pic, chacune est isolee.
-    Sert aussi la regle de relief -- l'aqua est a 2.82:1 sur blanc.
+    Not at the end of the curve: the four series converge towards 0 on Sunday
+    evening, where the labels would overlap. On its peak each one is isolated.
+    Also serves the relief rule -- the aqua sits at 2.82:1 on white.
     """
     k = int(np.argmax(y))
     ax.annotate(text, xy=(k, y[k]), xytext=(0, 8), textcoords="offset points",
@@ -123,32 +142,33 @@ def build_figure():
     fig = plt.figure(figsize=(13, 12))
     gs = fig.add_gridspec(4, 2, height_ratios=[1.5, 1.0, 0.8, 1.2], hspace=0.55, wspace=0.18)
 
-    # --- 1. La semaine ---------------------------------------------------
+    # --- 1. The week -----------------------------------------------------
     ax1 = fig.add_subplot(gs[0, :])
     ax1.axhline(0, color=MUTED, lw=1.0, zorder=1)
-    ax1.plot(x, load, color=C_LOAD, lw=2.0, label="Charge réseau", zorder=3)
-    ax1.plot(x, pv, color=C_PV, lw=2.0, label="Production PV", zorder=3)
-    ax1.plot(x, bss, color=C_BSS, lw=2.0, label="Parc BSS (+ charge / − décharge)", zorder=3)
-    ax1.plot(x, net, color=INK, lw=1.6, ls="--", label="Net vu du transformateur", zorder=4)
-    _label_peak(ax1, bss, "Parc BSS", C_BSS)
+    ax1.plot(x, load, color=C_LOAD, lw=2.0, label="Network load", zorder=3)
+    ax1.plot(x, pv, color=C_PV, lw=2.0, label="PV production", zorder=3)
+    ax1.plot(x, bss, color=C_BSS, lw=2.0, label="BSS fleet (+ charge / − discharge)", zorder=3)
+    ax1.plot(x, net, color=INK, lw=1.6, ls="--", label="Net seen from the transformer", zorder=4)
+    _label_peak(ax1, bss, "BSS fleet", C_BSS)
     ax1.margins(y=0.16)
     _day_axis(ax1, n)
-    ax1.set_ylabel("Puissance [kW]", color=MUTED)
+    ax1.set_ylabel("Power [kW]", color=MUTED)
     ax1.set_title(
-        "Semaine simulée — le parc (±595 kW) domine largement la charge du quartier (pointe 199 kW)",
+        f"Simulated week — BSS fleet from {bss.min():+.0f} to {bss.max():+.0f} kW, "
+        f"neighbourhood load peaking at {load.max():.0f} kW",
         loc="left", fontsize=13, color=INK)
     ax1.legend(frameon=False, fontsize=10, ncol=4, loc="upper left",
                bbox_to_anchor=(0, -0.10))
 
-    # --- 2. Parc BSS puis SoC : DEUX PANNEAUX, jamais deux axes y ---------
+    # --- 2. BSS fleet then SoC: TWO PANELS, never two y axes --------------
     ax2 = fig.add_subplot(gs[1, :])
     ax2.axhline(0, color=MUTED, lw=1.0)
     ax2.fill_between(x, 0, bss, where=bss >= 0, color=C_BSS, alpha=0.30, lw=0)
     ax2.fill_between(x, 0, bss, where=bss < 0, color=C_LOAD, alpha=0.30, lw=0)
     ax2.plot(x, bss, color=C_BSS, lw=1.6)
     _day_axis(ax2, n)
-    ax2.set_ylabel("Parc BSS [kW]", color=MUTED)
-    ax2.set_title("Puissance du parc — aire verte : charge, aire bleue : décharge",
+    ax2.set_ylabel("BSS fleet [kW]", color=MUTED)
+    ax2.set_title("Fleet power — green area: charging, blue area: discharging",
                   loc="left", fontsize=12, color=INK)
 
     ax3 = fig.add_subplot(gs[2, :], sharex=ax2)
@@ -158,43 +178,43 @@ def build_figure():
     _day_axis(ax3, n)
     ax3.set_ylim(0, 105)
     ax3.set_ylabel("SoC [%]", color=MUTED)
-    ax3.set_title(f"État de charge — bande utile 10–100 %, plancher touché à "
-                  f"{soc.min():.0f} %, fin de semaine {soc[-1]:.0f} %",
+    ax3.set_title(f"State of charge — usable band 10–100 %, floor reached at "
+                  f"{soc.min():.0f} %, end of week {soc[-1]:.0f} %",
                   loc="left", fontsize=12, color=INK)
 
-    # --- 3. Profil journalier : 7 jours superposes + mediane --------------
+    # --- 3. Daily profile: 7 days overlaid + median -----------------------
     n_days = n // STEPS_PER_DAY
     hours = np.arange(STEPS_PER_DAY) * 24.0 / STEPS_PER_DAY
     for col, (serie, titre, couleur) in enumerate(
-            ((load, "Charge réseau", C_LOAD), (bss, "Parc BSS", C_BSS))):
+            ((load, "Network load", C_LOAD), (bss, "BSS fleet", C_BSS))):
         ax = fig.add_subplot(gs[3, col])
         days = serie[:n_days * STEPS_PER_DAY].reshape(n_days, STEPS_PER_DAY)
         for d in range(n_days):
             ax.plot(hours, days[d], color=MUTED, lw=0.9, alpha=0.45, zorder=2)
         med = np.median(days, axis=0)
-        ax.plot(hours, med, color=couleur, lw=2.4, zorder=3, label="Médiane")
+        ax.plot(hours, med, color=couleur, lw=2.4, zorder=3, label="Median")
         ax.axhline(0, color=MUTED, lw=1.0, zorder=1)
-        # Annotation posee DU COTE INTERIEUR de l'extremum (au-dessus d'un
-        # minimum, au-dessous d'un maximum) : l'inverse la poussait hors des
-        # axes, sur le titre a gauche et sous les ticks a droite.
+        # Annotation placed on the INNER side of the extremum (above a minimum,
+        # below a maximum): the other way round pushes it out of the axes, onto
+        # the title on the left and under the ticks on the right.
         k = int(np.argmax(np.abs(med)))
         ax.margins(y=0.18)
-        ax.annotate(f"{med[k]:+.0f} kW à {int(hours[k]):02d}h{int(hours[k] % 1 * 60):02d}",
+        ax.annotate(f"{med[k]:+.0f} kW at {int(hours[k]):02d}:{int(hours[k] % 1 * 60):02d}",
                     xy=(hours[k], med[k]), xytext=(0, 12 if med[k] < 0 else -20),
                     textcoords="offset points", ha="center", fontsize=10, color=INK)
         ax.set_xlim(0, 24)
         ax.set_xticks(np.arange(0, 25, 6))
-        ax.set_xticklabels([f"{h:02d}h" for h in range(0, 25, 6)])
+        ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 25, 6)])
         ax.tick_params(colors=MUTED)
         ax.grid(color=GRID)
-        ax.set_xlabel("Heure", color=MUTED)
+        ax.set_xlabel("Hour", color=MUTED)
         if col == 0:
-            ax.set_ylabel("Puissance [kW]", color=MUTED)
-        ax.set_title(f"{titre} — {n_days} jours superposés (gris) et médiane",
+            ax.set_ylabel("Power [kW]", color=MUTED)
+        ax.set_title(f"{titre} — {n_days} days overlaid (grey) and median",
                      loc="left", fontsize=12, color=INK)
         ax.legend(frameon=False, fontsize=10, loc="best")
 
-    fig.suptitle("Digital twin Bressoux — profils du parc de batteries centralisé",
+    fig.suptitle("Bressoux digital twin — battery fleet profiles (b0 + b1..bn)",
                  x=0.012, ha="left", fontsize=15, color=INK)
     return fig
 
@@ -203,4 +223,4 @@ if __name__ == "__main__":
     fig = build_figure()
     os.makedirs(os.path.dirname(OUT_PATH) or ".", exist_ok=True)
     fig.savefig(OUT_PATH, dpi=150, bbox_inches="tight", facecolor="white")
-    print(f"Figure ecrite : {OUT_PATH}")
+    print(f"Figure written: {OUT_PATH}")
