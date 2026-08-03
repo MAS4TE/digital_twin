@@ -18,6 +18,8 @@ interfacing
 
 load_assignment
 pv_modelling
+bss_modelling
+electrification_scenarios
 data_files
 ```
 

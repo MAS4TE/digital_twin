@@ -2,13 +2,13 @@
 Volet PV -- Brique 1 : controle visuel du placement des installations PV.
 
 Scatter des 333 bus residentiels reels (coordonnees issues de la
-reconstruction reseau, cf. sourcecode/digital_twin._build_network) : bus non
+reconstruction reseau, cf. data/bressoux/inputs/network.build_network) : bus non
 equipes en gris clair, bus equipes PV colores par rue (pour verifier l'effet
 grappe), maison de repos marquee a part. Backend Agg, sortie PNG dans
 outputs_pv_metadata/.
 
 Prerequis : data/pv_installations.csv doit exister (executer
-`python -m sourcecode.pv_metadata` sinon).
+`python -m digital_twin.data_processing.pv` sinon).
 
 Script de controle, hors pipeline de production : ne modifie pas
 digital_twin.py, lecture seule.
@@ -21,10 +21,10 @@ import matplotlib
 matplotlib.use("Agg")  # backend sur (savefig fiable, cf. soucis machine recurrents)
 import matplotlib.pyplot as plt
 
-from sourcecode.digital_twin import _build_network, _config_to_dict
+from digital_twin.utils import _config_to_dict, load_site_network
 
 OUT_DIR = "outputs_pv_metadata"
-PV_CSV = "data/pv_installations.csv"
+PV_CSV = "data/bressoux/inputs/pv_installations.csv"
 REST_HOME_NAME = "Paradis du Bouhay"
 
 plt.rcParams.update({
@@ -40,10 +40,11 @@ plt.rcParams.update({
 def _bus_coords_and_streets():
     """dict bus_id -> (lon, lat, street) pour les 333 bus residentiels,
     plus les coords du bus maison de repos, obtenus depuis le VRAI reseau
-    reconstruit (pas une re-derivation independante depuis coordonnées.csv,
+    reconstruit (pas une re-derivation independante depuis coordinates.csv,
     pour garantir la coherence bus_id <-> position)."""
     cfg = _config_to_dict(None)
-    net, buses, mv_nodes, validation, _ = _build_network(cfg)
+    network = load_site_network(cfg)
+    net, buses, mv_nodes = network["net"], network["buses"], network["mv_nodes"]
 
     coords = {}
     for (street, num), b in buses.items():
@@ -90,7 +91,7 @@ def build_figure():
 
 if __name__ == "__main__":
     if not os.path.exists(PV_CSV):
-        raise FileNotFoundError(f"{PV_CSV} introuvable -- executer `python -m sourcecode.pv_metadata` d'abord.")
+        raise FileNotFoundError(f"{PV_CSV} introuvable -- executer `python -m digital_twin.data_processing.pv` d'abord.")
     os.makedirs(OUT_DIR, exist_ok=True)
     fig = build_figure()
     out_path = os.path.join(OUT_DIR, "pv_placement_check.png")
