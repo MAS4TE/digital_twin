@@ -67,7 +67,7 @@ supply a bank parquet therefore never needs to own a raw meter file.
 
 `generate_load_profiles` then writes **both**
 `out/processed/load_profiles.csv` (index `'Mon 00:00'..'Sun 23:45'`, columns
-`profile_{id}`, values in **MW**) and an updated `metadata.csv` whose
+`profile_{id}`, values in **kW**) and an updated `metadata.csv` whose
 `source_street`, `source_month`, `source_week_start` and `source_ean_index`
 describe the weeks actually drawn. Writing one without the other is how the two
 silently drift apart.
@@ -149,9 +149,11 @@ only profiles) falls back to a seeded street-filtered draw, with a
 - Each load is modelled in **active and reactive power**: reactive power is
   derived from the active profile using a fixed residential power factor
   (cos φ = 0.95).
-- Profiles are at a fixed **15-minute** step (672 steps per week) in MW/MVAr,
-  matching pandapower's units. Near-zero loads are clipped to a small positive
-  value to avoid power-flow convergence issues.
+- Profiles are at a fixed **15-minute** step (672 steps per week), in **kW**
+  at the `households`/`load_profiles.csv` interface; `_assign_loads` converts
+  to MW/MVAr internally, matching pandapower's units, right before assignment.
+  Near-zero loads are clipped to a small positive value to avoid power-flow
+  convergence issues.
 
 ```{note}
 **The clipping floor erases the diversity of near-vacant dwellings.** In June,

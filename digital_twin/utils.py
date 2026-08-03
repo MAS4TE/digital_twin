@@ -94,26 +94,17 @@ def bank_path_for(data_path):
     """
     return os.path.join(str(data_path).rstrip('/'), "out", "processed", CONSUMPTION_BANK_FILE)
 
-# BSS naming, two levels kept apart -- two PHYSICAL objects, not a park and its
-# accounting slices:
-#   bss_park_*        : specs of the CENTRAL battery b0, on an MV node (config keys)
-#   battery_size_kwh  : the capacity of ONE DOMESTIC battery b1..bn, on its own LV
-#                       bus (a column of the equipment table, see
-#                       data_processing.equipment.BSS_SIZE_COLUMN). Keeps the
-#                       MAS4TE schema name -- don't rename unilaterally.
-# Nothing constrains their sum: a domestic battery is not a share of the park.
-# What IS checked, in digital_twin._validate_inputs, is that the schedule's
-# b1..bn and the equipment table's non-zero capacities designate THE SAME
-# batteries.
+# BSS naming: b0 (the CENTRAL battery, on an MV node) and b1..bn (DOMESTIC
+# batteries, one per equipped LV bus) are now both ROWS of the equipment table
+# (see data_processing.equipment.place_central_bss / place_bss) -- generated
+# once, at data-generation time, like PV. Nothing constrains their sum: a
+# domestic battery is not a share of the park. What IS checked, in
+# digital_twin._validate_inputs, is that the schedule's b1..bn and the
+# equipment table's non-zero capacities designate THE SAME batteries.
 #
-# Unlike v_min/v_max/cos_phi, park specs describe one specific park, so silently
-# defaulting them is a scenario error -- hence check_bss_config_specs.
-BSS_PHYSICAL_SPEC_KEYS = ('bss_park_e_kwh', 'bss_park_p_kw')
-
-# Other recognised bss_* keys. These drive the INJECTION rather than the park's
-# physical size, so a default is legitimate and they are exempt from the fallback
-# warning above. Listed only so check_bss_config_specs doesn't read them as typos.
-BSS_OPTIONAL_KEYS = ('bss_bus', 'bss_eta', 'bss_enforce_limits', 'bss_c_rate')
+# Central battery identifier, shared by utils.bss_c_rate (derives the domestic
+# C-rate from b0's row) and data_processing.bss (schedules b0 alongside b1..bn).
+BSS_CENTRAL_ID = 'b0'
 
 # State-of-charge band, shared by the engine (digital_twin._track_bss_soc) and the
 # reference schedule generator (data_processing.bss). Defined HERE rather than in
@@ -122,7 +113,7 @@ BSS_OPTIONAL_KEYS = ('bss_bus', 'bss_eta', 'bss_enforce_limits', 'bss_c_rate')
 BSS_SOC_MIN_FRAC = 0.1    # unusable reserve: min_e_mwh = 10% of capacity
 BSS_SOC_INIT = 0.5        # state of charge at step 0
 
-# Equipment-table columns the ENGINE also has to name: the schedule's b1..bn are
+# Equipment-table columns the ENGINE also has to name: the schedule's b0..bn are
 # matched against them, and their bus_id is where the storage elements land.
 # Defined HERE rather than in data_processing.equipment (their natural owner)
 # only because of the import direction: data_processing.pv imports the engine, so
@@ -131,6 +122,12 @@ BSS_SOC_INIT = 0.5        # state of charge at step 0
 # names, so its consumers are unaffected.
 BSS_ID_COLUMN = 'battery_id'
 BSS_SIZE_COLUMN = 'battery_size_kwh'
+# Explicit power rating -- meaningful ONLY on the central battery's row (b0): a
+# park cannot derive its own power from itself, unlike a domestic battery, whose
+# rating is DERIVED (battery_size_kwh * bss_c_rate(...)) rather than stored, so
+# the two numbers can never silently drift apart. Domestic rows keep this column
+# at its 0.0 default.
+BSS_P_MAX_COLUMN = 'battery_p_max_kw'
 
 # Weekly time index 'Mon 00:00'..'Sun 23:45'. This is the exact index format of
 # load_profiles.csv; every generator that fills the same shape reuses it so a
@@ -190,20 +187,18 @@ def _config_to_dict(config):
         # 'bank_path' is NOT listed here: it derives from the FINAL data_path
         # (after the caller's overrides are merged), see below.
         'export_aggregate_profile': False,    # opt-in 672-row profile_agg export
-        # CENTRAL battery (b0) specs -- scenario-tunable, not universal constants.
-        # The domestic batteries b1..bn take their capacity from the equipment
-        # table instead, one row per LV bus.
-        'bss_park_e_kwh': 2600.0,             # park energy capacity [kWh] (FZJ high-energy park)
-        'bss_park_p_kw': 595.0,               # park power rating [kW]     (FZJ high-energy park)
-        # Injection parameters (see digital_twin._inject_bss_storage): engine-level
-        # choices with defensible defaults, hence not in BSS_PHYSICAL_SPEC_KEYS.
-        # No 'bss_enabled' flag -- the layer is active exactly when schedules_BSS
-        # is passed, the same activation-by-presence idiom as pv_profiles.
-        'bss_bus': 'MALVOZ BRESSOUX',         # MV node NAME (a network['mv_nodes'] key) or bus id
+        # BSS: the fleet's PHYSICAL facts (which batteries exist, where, how big --
+        # central b0 included) live in the equipment table now, generated once at
+        # data-generation time (see data_processing.equipment.place_central_bss /
+        # place_bss), NOT here. What's left here are pure engine-level injection
+        # choices with defensible universal defaults. No 'bss_enabled' flag -- the
+        # layer is active exactly when schedules_BSS is passed, the same
+        # activation-by-presence idiom as pv_profiles.
         'bss_eta': 0.95,                       # one-way efficiency, 1.0 = lossless
         'bss_enforce_limits': True,           # clip the schedule to the power and SoC limits
         'bss_c_rate': None,                   # None -> DERIVED from the park, see bss_c_rate()
         'export_bss_soc': False,              # opt-in per-battery SoC timeseries export
+        'verbose': False,                     # print scenario/result info + progress bar during the run
     }
     cfg = dict(defaults) if config is None else {**defaults, **config}
     # Derived AFTER the merge, so a caller that overrides only data_path gets a
@@ -213,12 +208,75 @@ def _config_to_dict(config):
 
 
 # ============================================================
-#  BSS: derived quantities and scenario-definition checks
+#  BSS: the equipment-table reader and derived quantities
 # ============================================================
-def bss_c_rate(config):
+def bss_register(equipment):
+    """{battery_id: {'bus_id', 'e_kwh', 'p_max_kw'}} for EVERY battery row of
+    `equipment` -- 'b0' (the central battery, see
+    data_processing.equipment.place_central_bss) and 'b1'..'bn' (domestic,
+    place_bss), now both rows of the SAME table.
+
+    'p_max_kw' is the row's own battery_p_max_kw for 'b0' (a park cannot derive
+    its own power from itself, so it is stored explicitly) and None for every
+    domestic id: their rating is DERIVED (e_kwh * bss_c_rate(...)) at the one
+    place that actually needs a number (digital_twin._bss_fleet_specs /
+    data_processing.bss.build_bss_schedule) -- storing a placeholder here would
+    let the two silently drift.
+
+    Returns {} when `equipment` is None or empty.
+
+    Raises
+    ------
+    ValueError
+        A required column is missing (battery_p_max_kw included -- this is what
+        makes a stale, un-regenerated equipment.csv fail loudly rather than
+        silently omitting the central battery), a battery_size_kwh > 0 row has
+        no battery_id ("orphan"), or two rows share a battery_id.
+    """
+    if equipment is None or len(equipment) == 0:
+        return {}
+    required = {'bus_id', BSS_ID_COLUMN, BSS_SIZE_COLUMN, BSS_P_MAX_COLUMN}
+    missing = required - set(equipment.columns)
+    if missing:
+        raise ValueError(
+            f"`equipment` has no {sorted(missing)} column(s), required to locate the "
+            "batteries (see data_processing.equipment) -- regenerate equipment.csv if "
+            "it predates the central-battery-as-a-row schema."
+        )
+
+    sizes = pd.to_numeric(equipment[BSS_SIZE_COLUMN], errors='coerce').fillna(0.0)
+    p_max = pd.to_numeric(equipment[BSS_P_MAX_COLUMN], errors='coerce').fillna(0.0)
+    equipped = equipment[sizes > 0]
+    ids = equipped[BSS_ID_COLUMN]
+
+    orphan = equipped.loc[ids.isna(), 'bus_id'].astype(int).tolist()
+    if orphan:
+        raise ValueError(
+            f"`equipment`: {len(orphan)} bus(es) carry a {BSS_SIZE_COLUMN} > 0 capacity "
+            f"without a {BSS_ID_COLUMN}: {orphan[:10]}"
+            f"{' ...' if len(orphan) > 10 else ''}. A battery without an identifier "
+            "cannot be tied to its schedule."
+        )
+    labels = [str(i) for i in ids]
+    dups = sorted(i for i, n in Counter(labels).items() if n > 1)
+    if dups:
+        raise ValueError(
+            f"`equipment`: duplicate {BSS_ID_COLUMN}: {dups[:10]}"
+            f"{' ...' if len(dups) > 10 else ''}. An identifier names a single battery."
+        )
+
+    equipped_p_max = p_max[sizes > 0]
+    return {
+        label: {'bus_id': int(bus), 'e_kwh': float(e),
+               'p_max_kw': float(p) if label == BSS_CENTRAL_ID else None}
+        for label, bus, e, p in zip(labels, equipped['bus_id'], sizes[sizes > 0], equipped_p_max)
+    }
+
+
+def bss_c_rate(config, equipment=None):
     """C-rate [1/h] applied to the DOMESTIC batteries: config['bss_c_rate'] when
-    the scenario sets one, otherwise DERIVED from the central park as
-    bss_park_p_kw / bss_park_e_kwh (0.229 C on the FZJ defaults).
+    the scenario sets one, otherwise DERIVED from the central battery's own row
+    of `equipment` (battery_p_max_kw / battery_size_kwh of 'b0').
 
     Deriving rather than defaulting to a literal keeps the fleet physically
     coherent: b0 and b1..bn are the same battery TECHNOLOGY at two scales, and a
@@ -232,9 +290,10 @@ def bss_c_rate(config):
     Raises
     ------
     ValueError
-        On a non-positive park capacity, which would make the derived rate
-        infinite. _validate_inputs also rejects that, but this function is
-        called by the schedule generator too, upstream of any validation.
+        No explicit config['bss_c_rate'] AND `equipment` carries no central
+        battery row -- a domestic-only fleet has no park to derive a rate from
+        and must set config['bss_c_rate'] itself. Also raised on a non-positive
+        park capacity, which would make the derived rate infinite.
     """
     explicit = config.get('bss_c_rate')
     if explicit is not None:
@@ -242,67 +301,22 @@ def bss_c_rate(config):
         if c <= 0:
             raise ValueError(f"config['bss_c_rate'] ({c}) must be strictly positive.")
         return c
-    e_kwh = float(config['bss_park_e_kwh'])
+
+    central = bss_register(equipment).get(BSS_CENTRAL_ID) if equipment is not None else None
+    if central is None:
+        raise ValueError(
+            "C-rate not derivable: `equipment` carries no central battery (b0) row "
+            "(see data_processing.equipment.place_central_bss), and config['bss_c_rate'] "
+            "is not set. A domestic-only battery fleet needs an explicit C-rate to size "
+            "its batteries' power -- pass config['bss_c_rate']."
+        )
+    e_kwh = central['e_kwh']
     if e_kwh <= 0:
         raise ValueError(
-            f"C-rate not derivable: config['bss_park_e_kwh'] ({e_kwh}) must be strictly "
-            "positive, or pass config['bss_c_rate'] explicitly."
+            f"C-rate not derivable: the central battery's capacity ({e_kwh} kWh) must be "
+            "strictly positive, or pass config['bss_c_rate'] explicitly."
         )
-    return float(config['bss_park_p_kw']) / e_kwh
-
-
-def check_bss_config_specs(config, bss_active=True):
-    """Warn when the park specs in use are the FZJ defaults because the caller
-    never set them.
-
-    `_config_to_dict` merges as `{**defaults, **config}`, so an absent or
-    misspelled key falls back with no trace: the merged dict looks the same
-    whether the caller set 2600.0 or never mentioned it. The fallback must
-    therefore be detected on the ORIGINAL config, by key presence, before the
-    merge.
-
-    A typo like 'bss_park_e_khw' is caught twice: the real key reads as absent,
-    and the stray bss_* key is named so it isn't left to hunt.
-
-    Parameters
-    ----------
-    config : dict or None    -- the caller's config, BEFORE _config_to_dict
-    bss_active : bool        -- no warning when the scenario has no BSS
-
-    Returns
-    -------
-    warnings : list[str]     -- '[BSS/config] ...' messages, empty if every spec
-                                was set explicitly
-    """
-
-    warnings = []
-    if not bss_active:
-        return warnings
-
-    provided = set(config.keys()) if config else set()
-    cfg = _config_to_dict(config)
-
-    for key in BSS_PHYSICAL_SPEC_KEYS:
-        if key not in provided:
-            warnings.append(
-                f"[BSS/config] '{key}' absent from the caller's config -- running on "
-                f"the FZJ default ({cfg[key]}). This is a physically meaningful park "
-                "spec, not a universal constant: set it explicitly to confirm it "
-                "matches this scenario's battery park."
-            )
-
-    known = set(BSS_PHYSICAL_SPEC_KEYS) | set(BSS_OPTIONAL_KEYS)
-    unknown = sorted(
-        k for k in provided
-        if str(k).startswith('bss_') and k not in known
-    )
-    if unknown:
-        warnings.append(
-            f"[BSS/config] unrecognized BSS key(s) in config: {unknown} -- ignored by "
-            f"the defaults merge (expected {sorted(known)}). Likely a typo."
-        )
-
-    return warnings
+    return central['p_max_kw'] / e_kwh
 
 
 # ============================================================
@@ -430,7 +444,7 @@ def load_site_network(config):
     `inputs/network.py` describing its nodes/lines, and this loader is the
     single place that knows how to find and call it -- reused by
     `process_data.process_data`, `data_processing.pv` (base network for the
-    multi-scenario tooling and for PV placement), and the check/viz scripts.
+    multi-scenario tooling and for PV placement), and digital_twin/plots/.
 
     Returns
     -------

@@ -18,10 +18,10 @@ out = run_digital_twin(config, metadata, network, households,
 | `config`         | `dict`             | Configuration parameters for the digital twin simulation.          |
 | `metadata`       | `pandas.DataFrame` | Per-household attributes (`profile_id`, `source_street`, ...).      |
 | `network`        | `dict`             | Network bundle (`net`, `buses`, `mv_nodes`, ...) built by a site's `inputs/network.py` -- see [Interfacing / the network input](#the-network-input) below. |
-| `households`     | `pandas.DataFrame` | Household consumption timeseries.                                   |
-| `pv_profiles`    | `pandas.DataFrame`, optional | Photovoltaic production profiles, in **MW**. |
+| `households`     | `pandas.DataFrame` | Household consumption timeseries, in **kW**.                        |
+| `pv_profiles`    | `pandas.DataFrame`, optional | Photovoltaic production profiles, in **kW**. |
 | `schedules_BSS`  | `pandas.DataFrame`, optional | Battery fleet schedule, long format, in **kW** -- see below. |
-| `equipment`      | `pandas.DataFrame`, optional | Bus-level equipment register; required as soon as `schedules_BSS` names domestic batteries. |
+| `equipment`      | `pandas.DataFrame`, optional | Bus-level equipment register; required as soon as `schedules_BSS` names ANY battery, central (`b0`) or domestic. |
 
 **Returns** a single `pandas.DataFrame` (`out`) containing the resulting
 time-series (voltages, loadings, ...) together with any warnings raised
@@ -41,12 +41,13 @@ steps repeated once per battery, and there are exactly two columns,
 | … | … | … |
 | `Mon 00:00` | `b1` | `+1.4` |
 
-`b0` is the **central** battery, placed on `config['bss_bus']`; `b1`…`bn` are
-**domestic** batteries, each on the LV bus the `equipment` table gives it. A
-battery exists exactly when the schedule names it, so central-only,
-domestic-only and both are all valid. The fleet actually read is reported back
-as a `[BSS/read]` warning, so the caller can confirm the file received is the
-file expected.
+`b0` is the **central** battery, `b1`…`bn` are **domestic** batteries -- both
+kinds placed and sized once, at data-generation time, as rows of the
+`equipment` table (see [BSS modelling](bss_modelling.md)), each on the bus its
+own row gives it. A battery exists exactly when the schedule names it, so
+central-only, domestic-only and both are all valid. The fleet actually read is
+reported back as a `[BSS/read]` warning, so the caller can confirm the file
+received is the file expected.
 
 Each battery is **injected** as its own pandapower `storage` element, on its own
 bus, driven timestep by timestep, with its own state of charge integrated
@@ -81,10 +82,23 @@ the *opposite* of the `sgen` convention `pv_profiles` follows, where positive
 means injection. Both live in the same engine, so the asymmetry is worth keeping
 in mind when preparing the two inputs.
 
-**Power ratings.** `b0` uses `config['bss_park_p_kw']`. A domestic battery's
-rating is derived: `battery_size_kwh × bss_c_rate(config)`, where the C-rate
-defaults to `bss_park_p_kw / bss_park_e_kwh` (0.229 C) unless
-`config['bss_c_rate']` sets it. The fleet is then one technology at two scales.
+**Power ratings.** `b0` uses its own `battery_p_max_kw` column in `equipment`
+(a park cannot derive its own power from itself). A domestic battery's rating
+is derived: `battery_size_kwh × bss_c_rate(config, equipment)`, where the
+C-rate defaults to the central battery's own `battery_p_max_kw /
+battery_size_kwh` (0.229 C on the Bressoux scenario) unless
+`config['bss_c_rate']` sets it explicitly -- required for a domestic-only
+fleet, which has no central battery to derive a rate from. The fleet is then
+one technology at two scales.
+
+```{warning}
+`config` no longer carries `bss_bus`, `bss_park_e_kwh` or `bss_park_p_kw` --
+every battery's bus/capacity/power is now a fact of `equipment.csv`, decided
+once at data-generation time (see [BSS modelling](bss_modelling.md)).
+`run_digital_twin` **raises** immediately if it sees any of these three keys
+in the caller's config, rather than silently ignoring a setting that used to
+matter and no longer does.
+```
 
 **Feasibility.** Two independent checks warn without rejecting: the
 instantaneous power against each battery's **own** rating (`[BSS/schedule]`) and
@@ -92,11 +106,12 @@ the cumulative energy against its **own** capacity (`[BSS/soc]`). Both are
 clipped rather than applied as-is when `config['bss_enforce_limits']` is set,
 which is the default — and the clipped series is what reaches the power flow.
 
-```{warning}
-`schedules_BSS` is in **kW**, while `households` and `pv_profiles` are in
-**MW**. This is the only kW interface of `run_digital_twin`, and the
-discrepancy cannot be detected from the values themselves — a schedule handed
-over in MW is silently read as 1000x too small.
+```{note}
+`schedules_BSS`, `households` and `pv_profiles` are all in **kW** at this
+interface. The conversion to MW (pandapower's own unit) happens once, inside
+`digital_twin.py`, right before injection into `net.load`/`net.sgen`/
+`net.storage` -- never before. A caller handing over any of the three in MW
+would be silently read as 1000x too small.
 ```
 
 A minimal usage example is given in [main.py](../main.py), which loads a

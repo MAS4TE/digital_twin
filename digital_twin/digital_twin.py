@@ -19,17 +19,20 @@ argument -- no enable flag for either:
   * `pv_profiles`   -> sgen injection (_inject_pv_sgens).
   * `schedules_BSS` -> storage injection (_bss_fleet_specs -> _read_bss_schedule
     -> _track_bss_soc -> _inject_bss_storage): a long-format schedule
-    (battery_id, p_kw) describing a fleet -- b0, the central battery on an MV
-    node (config['bss_bus']), and b1..bn, one domestic battery per equipped LV
-    bus. Each becomes its own pandapower storage element with its own capacity,
-    power rating and state of charge. A battery is present exactly when the
-    schedule names it, so central-only, domestic-only and both are all
-    expressible without a flag.
+    (battery_id, p_kw) describing a fleet -- b0, the central battery, and
+    b1..bn, one domestic battery per equipped LV bus. Each becomes its own
+    pandapower storage element with its own capacity, power rating and state of
+    charge. A battery is present exactly when the schedule names it, so
+    central-only, domestic-only and both are all expressible without a flag.
 
-`equipment` (the bus-level register, see data_processing.equipment) turns
-b1..bn into bus ids and capacities: the schedule carries identifiers, the table
-carries placement, and _validate_inputs requires the two to designate the SAME
-set of batteries. The engine holds no placement knowledge of its own.
+`equipment` (the bus-level register, see data_processing.equipment) is where
+EVERY battery's placement and physical specs live now -- b0 (generated once by
+place_central_bss) exactly like b1..bn (place_bss): the schedule carries
+identifiers, the table carries placement and sizing, and _validate_inputs
+requires the two to designate the SAME set of batteries. The engine holds no
+placement or config-level sizing knowledge of its own -- `config` only tunes
+injection behaviour (bss_eta, bss_enforce_limits, an optional bss_c_rate
+override), never a battery's bus or capacity.
 
 Two OPPOSITE sign conventions live in this file:
   * sgen (PV):     positive p_mw = INJECTION.
@@ -37,7 +40,9 @@ Two OPPOSITE sign conventions live in this file:
 The BSS schedule follows the storage one; _inject_bss_storage documents it for
 the whole BSS path.
 
-Units: schedules_BSS is in kW, households/pv_profiles in MW.
+Units: households, pv_profiles and schedules_BSS all arrive in kW. MW is a
+pandapower-internal detail: the conversion happens at _KW_TO_MW, right before
+injection into net.load/net.sgen/net.storage, and nowhere else.
 
 `network` is caller-supplied (see digital_twin.utils.load_site_network and
 data/bressoux/inputs/network.py for how a site builds one), never built here:
@@ -58,11 +63,17 @@ import pandapower as pp
 from pandapower.control import ConstControl
 from pandapower.timeseries import DFData, OutputWriter, run_timeseries
 
-from .utils import (BSS_ID_COLUMN, BSS_SIZE_COLUMN, BSS_SOC_INIT,
+from .utils import (BSS_CENTRAL_ID, BSS_SIZE_COLUMN, BSS_SOC_INIT,
                     BSS_SOC_MIN_FRAC, BUS_DOMAIN_EQUIPABLE, BUS_DOMAIN_LV,
                     BUS_DOMAIN_MV_NODE, STEPS_PER_DAY, _config_to_dict,
-                    _normalize_month, bss_c_rate, check_bss_config_specs,
-                    check_bus_ids)
+                    _normalize_month, bss_c_rate, bss_register, check_bus_ids)
+
+_REMOVED_BSS_CONFIG_KEYS = frozenset({'bss_bus', 'bss_park_e_kwh', 'bss_park_p_kw'})
+
+# THE kW -> MW conversion point for every one of households/pv_profiles/
+# schedules_BSS -- applied right before injection into pandapower
+# (net.load/net.sgen/net.storage), and nowhere else.
+_KW_TO_MW = 1e-3
 
 # ============================================================
 #  1. DATA INGESTION / INPUT VALIDATION
@@ -178,7 +189,7 @@ def _validate_inputs(config, metadata, network, households, pv_profiles, schedul
 
     # --- pv_profiles (optional) ---
     # Expected format: columns 'pv_{bus_id}' (integer bus_id), time index aligned
-    # on households ('Mon 00:00'..'Sun 23:45'), values in MW (same unit as
+    # on households ('Mon 00:00'..'Sun 23:45'), values in kW (same unit as
     # households, see run_digital_twin). Column shape, BUS ID CONTRACT and time
     # coverage are checked here; index alignment is checked at injection time
     # (_verify_temporal_alignment).
@@ -287,22 +298,28 @@ def _validate_inputs(config, metadata, network, households, pv_profiles, schedul
                 network, BUS_DOMAIN_LV, 'schedules_BSS (domestic batteries)',
             )
         if BSS_CENTRAL_ID in battery_ids:
+            full_register = bss_register(equipment)
+            central = full_register.get(BSS_CENTRAL_ID)
+            if central is None:
+                raise ValueError(
+                    "`schedules_BSS` names 'b0' but the equipment table carries no "
+                    "central battery row (see data_processing.equipment.place_central_bss)."
+                )
             check_bus_ids(
-                [_bss_resolve_central_bus(config, network['mv_nodes'])],
-                network, BUS_DOMAIN_MV_NODE,
-                f"config['bss_bus'] (central battery {BSS_CENTRAL_ID})",
+                [central['bus_id']], network, BUS_DOMAIN_MV_NODE,
+                f"equipment (central battery {BSS_CENTRAL_ID})",
             )
-            # Park specs are only load-bearing once b0 is actually injected, so
+            # Specs are only load-bearing once b0 is actually injected, so
             # they are validated here rather than in the unconditional block
             # above. The domestic C-rate also derives from them, but
             # utils.bss_c_rate raises on its own if they cannot serve.
-            if config['bss_park_e_kwh'] <= 0:
+            if central['e_kwh'] <= 0:
                 raise ValueError(
-                    f"config['bss_park_e_kwh'] ({config['bss_park_e_kwh']}) must be positive."
+                    f"equipment: central battery e_kwh ({central['e_kwh']}) must be positive."
                 )
-            if config['bss_park_p_kw'] <= 0:
+            if central['p_max_kw'] <= 0:
                 raise ValueError(
-                    f"config['bss_park_p_kw'] ({config['bss_park_p_kw']}) must be positive."
+                    f"equipment: central battery p_max_kw ({central['p_max_kw']}) must be positive."
                 )
         if not (0 < config['bss_eta'] <= 1):
             raise ValueError(
@@ -322,6 +339,10 @@ def _assign_loads(network, metadata, households, config):
     """Attach each LV charge bus to its household profile, plus the fixed
     deterministic profiles of the network's MV load facilities
     (network['mv_load_names']). Computes reactive power from cos_phi.
+
+    `households` and the MV load profiles (mv_load_profiles.csv) both arrive in
+    kW; the wide frame built here is converted to MW (_KW_TO_MW) right before
+    being returned, since it is fed to net.load.p_mw as-is by _run_powerflow.
     """
     warnings = []
 
@@ -389,7 +410,7 @@ def _assign_loads(network, metadata, households, config):
             f"{', '.join(mv_load_names)} left at zero load."
         )
 
-    df_profiles_p = pd.DataFrame(profiles_dict).clip(lower=1e-4)
+    df_profiles_p = (pd.DataFrame(profiles_dict) * _KW_TO_MW).clip(lower=1e-4)
 
     tan_phi = np.tan(np.arccos(config['cos_phi']))
     df_profiles_q = df_profiles_p * tan_phi
@@ -459,16 +480,15 @@ def _verify_temporal_alignment(df_load_p, df_other_p, label='PV'):
 #  column is checkable against the network, which is what lets each battery keep
 #  its own storage element, bus and state of charge.
 #
-#  Units: the schedule arrives in kW -- the ONLY kW interface of
-#  run_digital_twin -- and is converted to MW at _BSS_KW_TO_MW below and nowhere
-#  else. pv_profiles is already MW at its interface (the /1000 happens upstream
-#  in process_data), so the two are NOT symmetric.
+#  Units: the schedule arrives in kW, like households and pv_profiles, and is
+#  converted to MW at _KW_TO_MW (module-level, see above) right before the
+#  wide frame is handed to _run_powerflow.
 # ============================================================
-_BSS_KW_TO_MW = 1e-3
 
 BSS_BATTERY_ID_COLUMN = 'battery_id'   # long-format identifier column
 BSS_POWER_COLUMN = 'p_kw'              # long-format power column, kW
-BSS_CENTRAL_ID = 'b0'                  # the central battery, on an MV node
+# BSS_CENTRAL_ID ('b0') lives in utils now -- utils.bss_c_rate and
+# data_processing.bss need it too, both of which import from utils already.
 
 
 def _bss_storage_name(battery_id):
@@ -504,116 +524,42 @@ def _bss_battery_ids(schedules_BSS):
     return sorted(ids, key=lambda i: int(i[1:]))
 
 
-def _bss_resolve_central_bus(config, mv_nodes):
-    """Bus id of the CENTRAL battery, from config['bss_bus'] -- an MV node NAME
-    or an integer bus id.
-
-    Only the resolution lives here; whether the result is really an MV node is
-    the bus id contract's job (check_bus_ids, BUS_DOMAIN_MV_NODE, called from
-    _validate_inputs) so every layer is judged by the same mechanism.
-
-    An LV secondary bus is out of scope: build_network keeps `cabine_lv_bus`
-    local, so config has no stable handle to name one.
-    """
-    bss_bus = config['bss_bus']
-    valid = {name: int(b) for name, b in mv_nodes.items()}
-    if isinstance(bss_bus, str):
-        if bss_bus not in valid:
-            raise ValueError(
-                f"config['bss_bus'] = {bss_bus!r} is not an MV node of this network. "
-                f"Valid names: {sorted(valid)}."
-            )
-        return valid[bss_bus]
-    try:
-        return int(bss_bus)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"config['bss_bus'] = {bss_bus!r} is neither an MV node name nor an integer "
-            f"bus_id. Valid names: {sorted(valid)}."
-        )
-
-
 def _bss_domestic_register(equipment):
-    """{battery_id: {'bus_id', 'e_kwh'}} read off the equipment table.
+    """{battery_id: {'bus_id', 'e_kwh'}} for the DOMESTIC batteries (b1..bn)
+    only -- a thin filter over utils.bss_register, which now also covers the
+    central battery 'b0' (see data_processing.equipment.place_central_bss).
     """
-    if equipment is None or len(equipment) == 0:
-        return {}
-    missing = {'bus_id', BSS_ID_COLUMN, BSS_SIZE_COLUMN} - set(equipment.columns)
-    if missing:
-        raise ValueError(
-            f"`equipment` has no {sorted(missing)} column(s), required to locate the "
-            "domestic batteries (see data_processing.equipment)."
-        )
-
-    # Written as nullable Float64, read back as float64 -- or as an all-NaN
-    # object column when no bus is equipped. to_numeric keeps the comparison
-    # meaningful in both cases.
-    sizes = pd.to_numeric(equipment[BSS_SIZE_COLUMN], errors='coerce').fillna(0.0)
-    equipped = equipment[sizes > 0]
-    ids = equipped[BSS_ID_COLUMN]
-
-    orphan = equipped.loc[ids.isna(), 'bus_id'].astype(int).tolist()
-    if orphan:
-        raise ValueError(
-            f"`equipment`: {len(orphan)} bus(es) carry a {BSS_SIZE_COLUMN} > 0 capacity "
-            f"without a {BSS_ID_COLUMN}: {orphan[:10]}"
-            f"{' ...' if len(orphan) > 10 else ''}. A battery without an identifier "
-            "cannot be tied to its schedule."
-        )
-    labels = [str(i) for i in ids]
-    dups = sorted(i for i, n in Counter(labels).items() if n > 1)
-    if dups:
-        raise ValueError(
-            f"`equipment`: duplicate {BSS_ID_COLUMN}: {dups[:10]}"
-            f"{' ...' if len(dups) > 10 else ''}. An identifier names a single battery."
-        )
-    if BSS_CENTRAL_ID in labels:
-        raise ValueError(
-            f"`equipment`: '{BSS_CENTRAL_ID}' is reserved for the central battery, which "
-            "sits on an MV node and is not a row of this table (its specs are "
-            "config['bss_bus'], config['bss_park_e_kwh'], config['bss_park_p_kw']). "
-            "Renumber the domestic batteries as b1..bn."
-        )
-
-    return {label: {'bus_id': int(bus), 'e_kwh': float(e)}
-            for label, bus, e in zip(labels, equipped['bus_id'], sizes[sizes > 0])}
+    return {b: {'bus_id': v['bus_id'], 'e_kwh': v['e_kwh']}
+            for b, v in bss_register(equipment).items() if b != BSS_CENTRAL_ID}
 
 
-def _bss_fleet_specs(config, network, equipment, battery_ids):
+def _bss_fleet_specs(config, equipment, battery_ids):
     """{battery_id: {'bus_id', 'e_kwh', 'p_max_kw'}} for every battery the
-    schedule names.
-
-      b0     -- bus from config['bss_bus'], capacity and rating from
-                config['bss_park_e_kwh'] / config['bss_park_p_kw'].
-      b1..bn -- bus and capacity from the equipment table; domestic batteries
-                share the central park's C-rate
+    schedule names, read from `equipment` -- b0 and b1..bn are now rows of the
+    SAME table (see data_processing.equipment). b0's power is read directly
+    (its own battery_p_max_kw); a domestic battery's is DERIVED via
+    bss_c_rate(config, equipment).
     """
+    register = bss_register(equipment)
     specs = {}
-    if BSS_CENTRAL_ID in battery_ids:
-        specs[BSS_CENTRAL_ID] = {
-            'bus_id': _bss_resolve_central_bus(config, network['mv_nodes']),
-            'e_kwh': float(config['bss_park_e_kwh']),
-            'p_max_kw': float(config['bss_park_p_kw']),
-        }
-
-    domestic = _bss_domestic_register(equipment)
-    c_rate = bss_c_rate(config)
+    c_rate = None  # lazily computed, only if a domestic battery is actually scheduled
     for battery_id in battery_ids:
-        if battery_id == BSS_CENTRAL_ID:
-            continue
-        entry = domestic.get(battery_id)
+        entry = register.get(battery_id)
         if entry is None:
             # _validate_inputs compares the two sets and reports both in full;
             # this guard only covers callers reaching the engine's internals
-            # directly (the viz scripts do).
+            # directly (digital_twin/plots/ does).
             raise ValueError(
-                f"scheduled battery {battery_id!r} is absent from the equipment table "
-                f"(no row with {BSS_SIZE_COLUMN} > 0 carrying that identifier)."
+                f"scheduled battery {battery_id!r} is absent from the equipment table."
             )
-        specs[battery_id] = {
-            'bus_id': entry['bus_id'], 'e_kwh': entry['e_kwh'],
-            'p_max_kw': entry['e_kwh'] * c_rate,
-        }
+        if battery_id == BSS_CENTRAL_ID:
+            specs[battery_id] = {'bus_id': entry['bus_id'], 'e_kwh': entry['e_kwh'],
+                                 'p_max_kw': entry['p_max_kw']}
+        else:
+            if c_rate is None:
+                c_rate = bss_c_rate(config, equipment)
+            specs[battery_id] = {'bus_id': entry['bus_id'], 'e_kwh': entry['e_kwh'],
+                                 'p_max_kw': entry['e_kwh'] * c_rate}
     return specs
 
 
@@ -726,8 +672,8 @@ def _read_bss_schedule(schedules_BSS, df_load_p, config, specs, load_time_index=
                else " -- applied as-is (bss_enforce_limits=False).")
         )
 
-    # THE kW -> MW conversion point (see the unit convention above).
-    df_bss_p = pd.DataFrame({col: values * _BSS_KW_TO_MW
+    # kW -> MW (see _KW_TO_MW at the top of this module).
+    df_bss_p = pd.DataFrame({col: values * _KW_TO_MW
                              for col, values in columns.items()})
     # Same discipline as the PV path: df_load_p lost its text index to .values in
     # _assign_loads, so both sides are compared on the positional index.
@@ -877,7 +823,8 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None,
     if with_bss:
         ow.log_variable('res_storage', 'p_mw')       # sign: >0 = charging
 
-    run_timeseries(net, time_steps=range(n_timesteps), verbose=False)
+    # verbose=True makes pandapower print a tqdm progress bar over time_steps.
+    run_timeseries(net, time_steps=range(n_timesteps), verbose=bool(config['verbose']))
 
     out = {
         'vm': ow.output['res_bus.vm_pu'],
@@ -1048,6 +995,51 @@ def save_run_report(out, out_path):
 
     return out_path
 
+def _print_scenario_info(cfg, metadata, network, pv_profiles, schedules_BSS):
+    """config['verbose']: print what this run is about to simulate."""
+    has_pv = pv_profiles is not None and len(pv_profiles) > 0
+    has_bss = schedules_BSS is not None and len(schedules_BSS) > 0
+
+    print("=" * 60)
+    print("Digital twin run")
+    print("=" * 60)
+    print(f"  data_path       : {cfg['data_path']}")
+    print(f"  month simulated : {cfg['mois_simule']}")
+    print(f"  timesteps       : {cfg['n_timesteps']}")
+    print(f"  households      : {len(metadata)} (LV buses: {len(network.get('buses', {}))})")
+    print(f"  PV layer        : {'ON (' + str(len(pv_profiles.columns)) + ' buses)' if has_pv else 'OFF'}")
+    if has_bss:
+        print(f"  BSS layer       : ON ({len(_bss_battery_ids(schedules_BSS))} batteries)")
+    else:
+        print("  BSS layer       : OFF")
+    print(f"  thresholds      : v in [{cfg['v_min']}, {cfg['v_max']}] pu, loading <= {cfg['loading_max']}%")
+    print("-" * 60)
+
+
+def _print_results_info(out, warnings):
+    """config['verbose']: print the verdict once the run is done."""
+    summary = out.loc[out['category'] == 'summary'].set_index('metric')['value']
+    n_violations = int((out['category'] == 'violation').sum())
+
+    print("-" * 60)
+    print("Digital twin results")
+    print(f"  network valid       : {summary.get('network_valid')}")
+    min_v, max_v = summary.get('min_voltage_pu'), summary.get('max_voltage_pu')
+    if min_v is not None and max_v is not None:
+        print(f"  voltage range (pu)  : [{min_v:.4f}, {max_v:.4f}]")
+    max_line = summary.get('max_line_loading_pct')
+    if max_line is not None:
+        print(f"  max line loading    : {max_line:.1f}%")
+    max_trafo = summary.get('max_trafo_loading_pct')
+    if max_trafo is not None:
+        print(f"  max trafo loading   : {max_trafo:.1f}%")
+    print(f"  violations          : {n_violations} "
+         f"({summary.get('n_voltage_violations')} voltage, "
+         f"{summary.get('n_loading_violations')} loading)")
+    print(f"  warnings            : {len(warnings)}")
+    print("=" * 60)
+
+
 def run_digital_twin(config, metadata, network, households,
                      pv_profiles=None, schedules_BSS=None, equipment=None):
     """Run the digital twin on a given network and return a network verdict.
@@ -1065,56 +1057,70 @@ def run_digital_twin(config, metadata, network, households,
         layers are checked (see _validate_inputs): a caller supplying profiles
         for buses this network does not have, or for buses no equipment may sit
         on, is rejected here rather than deep inside pandapower.
-    households : pd.DataFrame    # consumption profiles (n_timesteps x n_profiles), MW
+    households : pd.DataFrame    # consumption profiles (n_timesteps x n_profiles), kW
     pv_profiles : pd.DataFrame, optional
         PV production. Columns 'pv_{bus_id}' (integer network bus_id), time index
-        aligned on households ('Mon 00:00'..'Sun 23:45'), values in MW (SAME
-        unit as households -- if the production comes from
-        pv.build_pv_production, which outputs kW, convert /1000 upstream, see
-        main.py). When provided: injected as sgen, loads + PV power flow. When
-        None: no PV (loads-only).
+        aligned on households ('Mon 00:00'..'Sun 23:45'), values in kW (SAME
+        unit as households -- matches pv.build_pv_production's own output
+        directly, no conversion needed upstream). When provided: injected as
+        sgen, loads + PV power flow. When None: no PV (loads-only).
     schedules_BSS : pd.DataFrame, optional
         Battery fleet schedule, LONG format: index = the time steps (aligned on
         households) repeated once per battery, and two columns --
         'battery_id' and 'p_kw'.
-        IDENTIFIERS: 'b0' is the CENTRAL battery, placed on config['bss_bus'];
-        'b1'..'bn' are DOMESTIC batteries, each on the LV bus the `equipment`
-        table gives it. A battery exists exactly when the schedule names it.
-        Values in **kW** -- the only kW interface here, households and
-        pv_profiles are in MW.
+        IDENTIFIERS: 'b0' is the CENTRAL battery, 'b1'..'bn' are DOMESTIC
+        batteries -- both kinds placed and sized once, at data-generation time,
+        as rows of the `equipment` table (see data_processing.equipment
+        .place_central_bss / place_bss). A battery exists exactly when the
+        schedule names it.
+        Values in **kW**, like households and pv_profiles.
         SIGN: positive = CHARGING, negative = discharge -- the storage
         convention, OPPOSITE of the sgen one `pv_profiles` follows.
         When provided: one pandapower storage per battery, each driven per
         timestep with its own state of charge tracked and reported (bss_*
         metrics). When None: no BSS. Passing the schedule IS the activation, as
         for pv_profiles.
-        Related config: bss_bus / bss_park_e_kwh / bss_park_p_kw / bss_c_rate /
-        bss_eta / bss_enforce_limits / export_bss_soc (see
-        digital_twin.utils._config_to_dict).
+        Related config: bss_c_rate (optional override, else derived from `equipment`'s
+        central row) / bss_eta / bss_enforce_limits / export_bss_soc (see
+        digital_twin.utils._config_to_dict) -- NOT bss_bus/bss_park_e_kwh/
+        bss_park_p_kw, which no longer exist: a battery's bus and capacity are a
+        DATA fact (equipment.csv), never a runtime config scalar.
     equipment : pd.DataFrame, optional
         Bus-level equipment register (see data_processing.equipment): one row per
-        equipable bus, carrying `battery_id` and `battery_size_kwh`. Required as
-        soon as `schedules_BSS` names domestic batteries -- it is what turns
-        b1..bn into bus ids and capacities, and what their identifiers are
-        checked against (by SET: a mismatch in either direction is an error, not
-        a warning). Not needed for a central-only schedule, nor for the PV layer,
-        whose placement already arrives baked into `pv_profiles`' column names.
+        equipable bus, carrying `battery_id`, `battery_size_kwh` and (on the
+        central row only) `battery_p_max_kw`. Required as soon as
+        `schedules_BSS` names ANY battery, central or domestic -- it is what
+        turns b0..bn into bus ids and capacities, and what their identifiers
+        are checked against (by SET: a mismatch in either direction is an
+        error, not a warning). Not needed for the PV layer, whose placement
+        already arrives baked into `pv_profiles`' column names.
 
     Returns
     -------
     out : pd.DataFrame
         Long-format result: summary (verdict) + violations + warnings.
     """
+    # Loud guard rail: these three keys used to be how a caller sized/placed the
+    # central battery; they are now a data fact (equipment.csv), generated once
+    # by data_processing.equipment.place_central_bss. A caller still setting
+    # them would otherwise be silently ignored -- a wrong-result trap far worse
+    # than raising here. Checked on the RAW config, before _config_to_dict.
+    if config and (bad := _REMOVED_BSS_CONFIG_KEYS & set(config)):
+        raise ValueError(
+            f"config carries {sorted(bad)}, which run_digital_twin no longer reads: "
+            "the central battery's bus/capacity/power are now a row of `equipment` "
+            "(see data_processing.equipment.place_central_bss), generated once rather "
+            "than passed at run time. Remove these keys from your config."
+        )
+
     cfg = _config_to_dict(config)
+
+    if cfg['verbose']:
+        _print_scenario_info(cfg, metadata, network, pv_profiles, schedules_BSS)
 
     warnings = _validate_inputs(cfg, metadata, network, households, pv_profiles,
                                 schedules_BSS, equipment)
     warnings += network.get('warnings', [])
-    # On the RAW config, deliberately: the point is to detect keys the caller
-    # never set, and the merge above makes an absent key indistinguishable from
-    # one explicitly set to the default value.
-    warnings += check_bss_config_specs(
-        config, bss_active=schedules_BSS is not None and len(schedules_BSS) > 0)
 
     df_p, df_q, bus_to_profile, w_assign = _assign_loads(
         network, metadata, households, cfg)
@@ -1128,8 +1134,9 @@ def run_digital_twin(config, metadata, network, households,
         # Positional alignment: _assign_loads builds df_p via .values, dropping
         # the text index 'Mon 00:00'.. for a RangeIndex. pv_profiles must sit on
         # the same RangeIndex before the alignment check and the power flow,
-        # since DFData/ConstControl index by position.
-        df_pv_p = pv_profiles.reset_index(drop=True)
+        # since DFData/ConstControl index by position. kW -> MW here (_KW_TO_MW),
+        # the same conversion point as _assign_loads and _read_bss_schedule.
+        df_pv_p = pv_profiles.reset_index(drop=True) * _KW_TO_MW
         _verify_temporal_alignment(df_p, df_pv_p)
         _inject_pv_sgens(net, df_pv_p)
 
@@ -1140,8 +1147,7 @@ def run_digital_twin(config, metadata, network, households,
     # its own to .values in _assign_loads.
     df_bss_p, df_bss_soc, bss_specs = None, None, {}
     if schedules_BSS is not None and len(schedules_BSS) > 0:
-        bss_specs = _bss_fleet_specs(cfg, network, equipment,
-                                     _bss_battery_ids(schedules_BSS))
+        bss_specs = _bss_fleet_specs(cfg, equipment, _bss_battery_ids(schedules_BSS))
         df_bss_p, w_bss = _read_bss_schedule(
             schedules_BSS, df_p, cfg, bss_specs, load_time_index=households.index)
         warnings += w_bss
@@ -1184,5 +1190,8 @@ def run_digital_twin(config, metadata, network, households,
         soc_rows['metric'] = 'soc_frac'
         soc_rows['detail'] = None
         out = pd.concat([out, soc_rows[out.columns]], ignore_index=True)
+
+    if cfg['verbose']:
+        _print_results_info(out, warnings)
 
     return out

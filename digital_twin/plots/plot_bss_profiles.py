@@ -15,8 +15,8 @@ on one more time series.
 
 Why the engine internals rather than `out`: run_digital_twin returns only scalars
 (summary), violations and warnings -- the time series computed in _run_powerflow
-are consumed by _evaluate and then dropped. The other scripts/viz/ scripts reach
-in the same way.
+are consumed by _evaluate and then dropped. The other digital_twin/plots/ scripts
+reach in the same way.
 
 Check script, outside the production pipeline: read-only, writes a single PNG.
 """
@@ -28,12 +28,12 @@ matplotlib.use("Agg")  # headless backend, so savefig does not depend on a displ
 import matplotlib.pyplot as plt
 
 from digital_twin.data_processing.process_data import process_data
-from digital_twin.digital_twin import (_BSS_KW_TO_MW, _assign_loads, _bss_battery_ids,
+from digital_twin.digital_twin import (_KW_TO_MW, _assign_loads, _bss_battery_ids,
                                        _bss_fleet_specs, _bss_storage_name,
                                        _read_bss_schedule, _track_bss_soc)
 from digital_twin.utils import STEPS_PER_DAY, STEPS_PER_WEEK, _config_to_dict
 
-OUT_PATH = "scripts/viz/bss_profiles.png"
+OUT_PATH = "digital_twin/plots/bss_profiles.png"
 
 CONFIG = {
     'data_path': "data/bressoux",
@@ -84,14 +84,14 @@ def load_series():
         )
 
     df_p, _, _, _ = _assign_loads(network, metadata, households, cfg)
-    load_kw = df_p.sum(axis=1).to_numpy() * 1000.0
-    pv_kw = (pv_profiles.sum(axis=1).to_numpy() * 1000.0
+    load_kw = df_p.sum(axis=1).to_numpy() / _KW_TO_MW
+    pv_kw = (pv_profiles.sum(axis=1).to_numpy()
              if pv_profiles is not None else np.zeros_like(load_kw))
 
     # The fleet is aggregated FOR THE FIGURE only; the twin injects one battery
     # per bus. These curves answer "what does the transformer see", and the sum
     # is the right answer to that question.
-    specs = _bss_fleet_specs(cfg, network, equipment, _bss_battery_ids(schedules_BSS))
+    specs = _bss_fleet_specs(cfg, equipment, _bss_battery_ids(schedules_BSS))
     df_bss_p, _ = _read_bss_schedule(schedules_BSS, df_p, cfg, specs,
                                      load_time_index=households.index)
 
@@ -99,7 +99,7 @@ def load_series():
     # clipped version is what the twin injects. Plotting the raw schedule would
     # show a figure the power flow never sees.
     df_soc, df_applied, _ = _track_bss_soc(df_bss_p, specs, cfg)
-    bss_kw = df_applied.sum(axis=1).to_numpy() / _BSS_KW_TO_MW
+    bss_kw = df_applied.sum(axis=1).to_numpy() / _KW_TO_MW
 
     # Fleet SoC = total stored energy / total capacity, hence weighted by the
     # capacities. A plain mean would give a 10 kWh battery the same weight as

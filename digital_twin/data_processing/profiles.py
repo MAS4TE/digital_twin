@@ -29,7 +29,7 @@ PORTABILITY. Two layers with very different reach live here:
     supplies its `households` directly.
   * everything downstream is site-agnostic. The BANK PARQUET is the portable
     seam: a scenario that can produce a frame with `street`, `month` and
-    t0000..t0671 columns (MW) gets generate_household_metadata and
+    t0000..t0671 columns (kW) gets generate_household_metadata and
     generate_load_profiles for free, whatever filled it -- without ever owning
     a raw meter file.
 """
@@ -99,7 +99,7 @@ def _ean_power_series(df, ean):
 def build_consumption_bank(data_path=RAW_DATA_PATH, out_path=None):
     """Extract all complete real calendar weeks (672 steps, Mon-Sun) of the kept
     EANs, tagged by EAN/month/season/STREET, and persist them to parquet (wide
-    format: meta columns + t0000..t0671 in MW).
+    format: meta columns + t0000..t0671 in kW).
 
     `out_path` defaults to utils.bank_path_for(data_path) -- the SAME path the
     consumer resolves from config['bank_path'], so generating the bank here
@@ -165,8 +165,8 @@ def build_consumption_bank(data_path=RAW_DATA_PATH, out_path=None):
                 "month": ws.month, "season": MONTH_TO_SEASON[ws.month],
                 "week_start": ws.isoformat(),
             }
-            # kW -> MW, consistent with load_profiles.csv (already in MW)
-            row.update({f"t{k:04d}": v / 1000.0 for k, v in enumerate(wv.values)})
+            # kW, consistent with load_profiles.csv (also kW): no conversion.
+            row.update({f"t{k:04d}": v for k, v in enumerate(wv.values)})
             rows.append(row)
 
     bank = pd.DataFrame(rows)
@@ -347,7 +347,7 @@ def _load_consumption_bank(bank_path):
 
 def _build_load_profiles_banque_mensuelle(metadata, config):
     """Fill a `households` timeseries in the load_profiles.csv format (index
-    'Mon 00:00'..'Sun 23:45', columns profile_{id}, values in MW), but whose
+    'Mon 00:00'..'Sun 23:45', columns profile_{id}, values in kW), but whose
     CONTENT comes from real EAN weeks of month `config['mois_simule']` (see
     build_consumption_bank above).
 
@@ -408,7 +408,7 @@ def _build_load_profiles_banque_mensuelle(metadata, config):
     sources = []
     for pid, j in zip(profile_ids, picks):
         j = int(j)
-        values = pool_month.loc[j, value_cols].to_numpy(dtype=float)  # already in MW
+        values = pool_month.loc[j, value_cols].to_numpy(dtype=float)  # already in kW
 
         draw_counts[j] = draw_counts.get(j, 0) + 1
         occurrence = draw_counts[j]
@@ -469,7 +469,7 @@ def generate_load_profiles(mois_simule, metadata=None, config=None,
     `<data_path>/out/processed/load_profiles.csv` from the bank of real EAN
     weeks of month `mois_simule`, in the exact format run_digital_twin's
     `households` argument expects (index 'Mon 00:00'..'Sun 23:45', columns
-    profile_{id}, values in MW).
+    profile_{id}, values in kW).
 
     ALSO UPDATES AND REWRITES metadata.csv, because the two files are one act:
     the draw is what decides which real week -- hence which street and which

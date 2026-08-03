@@ -61,7 +61,8 @@ Consumption profiles reach the buses in two decoupled stages: a scenario's
 The mapping is a lookup, not a draw: `metadata['bus_id']` declares it 1:1, and a
 caller supplying no such column falls back to a seeded draw with a warning.
 Reactive power uses a fixed residential power factor (cos φ = 0.95); profiles
-are at a 15-minute step in MW/MVAr.
+are at a 15-minute step, in kW at the `households` interface and converted to
+MW/MVAr internally, right before assignment.
 
 ## 4. Time-series power flow
 

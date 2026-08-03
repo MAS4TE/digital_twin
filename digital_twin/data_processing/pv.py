@@ -20,7 +20,8 @@ Brick 2 -- build_base_network / run_pv_scenario
     injection primitives themselves (sgen injection, alignment check, loads+PV
     power flow) live in digital_twin.digital_twin -- this module imports them
     (single source, no duplication) and keeps only the multi-scenario
-    orchestration used by scripts/pv_impact_analysis.py.
+    orchestration for comparing PV penetration rates on deep copies of one
+    base network.
 
     sgen convention: p_mw POSITIVE = injection (NOT a negative load) --
     pandapower's native behaviour for `sgen` elements (unlike `load`, where

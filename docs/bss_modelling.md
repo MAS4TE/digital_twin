@@ -13,22 +13,31 @@ This is the single most important thing to get right before reading anything
 else on this page.
 
 The twin models a **fleet**, and every battery in it is a physical object at a
-real point of the grid:
+real point of the grid. Both kinds are now **rows of the same `equipment.csv`**
+(see [Placement](#1-placement--the-equipment-table) below) — nothing about a
+battery's bus, capacity or power lives in runtime `config` any more:
 
 | id | what | where | sized by |
 |---|---|---|---|
-| `b0` | central battery | an MV node, `config['bss_bus']` | `bss_park_e_kwh`, `bss_park_p_kw` |
+| `b0` | central battery | an MV node | its own `battery_size_kwh` / `battery_p_max_kw` row |
 | `b1`…`bn` | domestic batteries | one per equipped LV bus | `battery_size_kwh` in the equipment table |
 
 A battery exists exactly when the schedule names it. Central-only,
-domestic-only and both are all expressible, and none of them needs a flag.
+domestic-only and both are all expressible, and none of them needs a flag —
+the fourth combination, neither, is simply an `equipment.csv` with no
+`battery_size_kwh > 0` row at all, and `process_data` returns `schedules_BSS
+= None`.
 
-Domestic batteries take the **central park's C-rate** rather than a power spec
-of their own: `utils.bss_c_rate(config)` returns `bss_park_p_kw /
-bss_park_e_kwh` (0.229 C on the defaults) unless the scenario sets
-`bss_c_rate`, and each battery's rating is `battery_size_kwh × c_rate`. The
-fleet is then one technology at two scales, and re-speccing the park drags the
-homes along instead of silently pairing a fast park with slow batteries.
+Domestic batteries take the **central battery's C-rate** rather than a power
+spec of their own: `utils.bss_c_rate(config, equipment)` returns
+`battery_p_max_kw / battery_size_kwh` of the equipment table's `b0` row
+(0.229 C on the Bressoux defaults) unless the scenario sets
+`config['bss_c_rate']`, and each domestic battery's rating is
+`battery_size_kwh × c_rate`. The fleet is then one technology at two scales,
+and re-speccing the central battery drags the homes along instead of silently
+pairing a fast park with slow batteries. A **domestic-only** fleet (no `b0`
+row) has no park to derive a rate from, so `bss_c_rate` *raises* unless
+`config['bss_c_rate']` is set explicitly.
 
 ```{mermaid}
 flowchart LR
@@ -71,8 +80,16 @@ battery is almost always installed alongside a PV system, and assigns
 `battery_id` as `b1`…`bn` in ascending `bus_id` order — deterministic, so the
 same table always yields the same identifiers.
 
-`b0` is deliberately **not** a row of that table: it lives on an MV node and its
-placement and size already have their own config keys.
+`b0` **is** a row of that table too, placed separately by `place_central_bss`:
+opt-in by `config['bss_bus']` presence (an MV node name or bus id — no key
+means no central battery, exactly like `mv_pv_installations`), sized by
+`config['bss_park_e_kwh']`/`config['bss_park_p_kw']` (both required and
+validated `> 0` as soon as `bss_bus` is set — unlike a domestic battery, the
+central one has no C-rate to derive its own power from). These three keys are
+**generation-time only**: consumed exclusively inside `generate_equipment_table`,
+never read by `run_digital_twin`, which in fact *raises* if it sees them in a
+caller's config (a loud guard against the wrong-result trap of setting a key
+that used to matter and now does nothing).
 
 ## 2. Schedule generation — `build_bss_schedule`
 
@@ -172,9 +189,9 @@ Two contracts are enforced in `_validate_inputs`, both as **errors**:
 1. `_bss_fleet_specs` — resolves the fleet once: each battery's bus, capacity
    and power rating. The contract check, the injection and the SoC tracking all
    read this one dict rather than re-deriving placement three times.
-2. `_read_bss_schedule` — pivots long → wide, converts kW → MW (the only such
-   conversion point), and checks each battery's instantaneous power against
-   **its own** rating.
+2. `_read_bss_schedule` — pivots long → wide, converts kW → MW (the same
+   `_KW_TO_MW` conversion point `_assign_loads` and the PV injection use), and
+   checks each battery's instantaneous power against **its own** rating.
 3. `_track_bss_soc` — integrates each state of charge separately, since
    pandapower does not update `soc_percent` during a time-series run. Per
    battery rather than fleet-wide because the capacities differ by two orders of
@@ -208,17 +225,19 @@ default because that is `n_batteries × n_timesteps` rows on every run.
 ## Generating the input file
 
 The fleet comes from the equipment table, so there is no separate register to
-generate any more:
+generate any more. Include `bss_bus`/`bss_park_e_kwh`/`bss_park_p_kw` to place
+a central battery too — omit them for a domestic-only fleet (`place_central_bss`
+then no-ops, table unchanged):
 
 ```bash
-python -c "from digital_twin.data_processing.equipment import generate_equipment_table; generate_equipment_table({'data_path': 'data/bressoux'})"
+python -c "from digital_twin.data_processing.equipment import generate_equipment_table; generate_equipment_table({'data_path': 'data/bressoux', 'bss_bus': 'MALVOZ BRESSOUX', 'bss_park_e_kwh': 2600.0, 'bss_park_p_kw': 595.0})"
 ```
 
 `process_data` then builds the schedule from that table on every call.
 
 ## Visual check
 
-`scripts/viz/plot_bss_profiles.py` draws the week (load, PV, fleet, net), the
+`digital_twin/plots/plot_bss_profiles.py` draws the week (load, PV, fleet, net), the
 fleet power against its capacity-weighted state of charge, and the daily
 profiles superimposed — without running any power flow. The fleet is aggregated
 *for the figure only*; those curves answer "what does the transformer see". Run

@@ -19,7 +19,7 @@ flowchart LR
     M --> C[(out/processed/equipment.csv)]
     A[(out/processed/pvgis_irradiance...parquet)] --> P(build_pv_production)
     C --> P
-    P -->|pv_profiles, kW -> MW| D(process_data)
+    P -->|pv_profiles, kW| D(process_data)
     D --> T(run_digital_twin)
     L[(out/processed/load_profiles.csv)] --> D
     T --> R[verdict: vm, violations, ...]
@@ -130,10 +130,9 @@ quarter-hourly steps, same layout as `households`), with columns
 The underlying model is `irradiance_to_power(irradiance_w_m2, kwp,
 system_factor=0.8)`, i.e. `power_kW = max(ghi, 0) / 1000 * kwp * system_factor`.
 
-```{warning}
-`build_pv_production` returns **kW**, whereas `run_digital_twin` expects
-`pv_profiles` in **MW** (same unit as `households`). The conversion is done
-by the caller — `pv_profiles = build_pv_production(...) / 1000.0`.
+```{note}
+`build_pv_production` returns **kW**, the same unit `run_digital_twin` expects
+for `pv_profiles` (and `households`) -- no conversion needed by the caller.
 ```
 
 ```{warning}
@@ -154,7 +153,7 @@ automatically: it loads `<data_path>/out/processed/equipment.csv` together with
 the site's cached PVGIS irradiance
 (`<data_path>/out/processed/pvgis_irradiance_quarter_hourly.parquet`, see
 `build_irradiance_reference` above), calls `build_pv_production` for
-`config['mois_simule']`, converts kW to MW, and returns it as `pv_profiles`.
+`config['mois_simule']`, and returns its kW output as `pv_profiles` directly.
 
 A scenario opts into PV by **content**: any row with `pv_system_size_kwp > 0`.
 If the table is absent or carries no PV, `pv_profiles` is `None` (loads-only)
@@ -162,7 +161,7 @@ with nothing else needed. Activation is carried by the register rather than by
 the presence of a file, so one register describes the whole scenario and it
 cannot be half-described.
 
-The produced `pv_profiles` (already in MW) is passed to `run_digital_twin`.
+The produced `pv_profiles` (kW) is passed to `run_digital_twin`.
 When present, the twin verifies temporal alignment against the loads, injects
 one `sgen` per PV column (generator convention: **positive `p_mw` =
 injection**), and runs the power flow with loads and PV together. The verdict
@@ -212,14 +211,13 @@ result = run_pv_scenario(network, metadata, equipment, irradiance,
                          config={"mois_simule": "juin"})
 ```
 
-The script `scripts/pv_impact_analysis.py` uses this layer to compare 0 / 30 /
-50 / 80 installations (summer, plus a winter check); the resulting metrics and
-figures are produced by `scripts/viz/plot_pv_impact_analysis.py`. It reports,
-per configuration, the maximum bus voltage, the number of buses above the 1.05
-pu and 1.10 pu limits, the location of any overvoltages, and reverse-flow
-indicators.
+This is the layer to reach for when comparing several PV penetrations (e.g.
+0 / 30 / 50 / 80 installations) over the same base network: run
+`run_pv_scenario` once per configuration and compare the returned `vm` (bus
+voltages), `line_load`/`trafo_load`, and `ext_grid_p` (reverse flow) across
+runs.
 
-The nested fleets are built **in place** with `extend_pv` on every run, so the
+Nested fleets are built **in place** with `extend_pv` on every run, so the
 50-fleet provably contains the 30-fleet and no stored file can drift out of sync
 with the network.
 

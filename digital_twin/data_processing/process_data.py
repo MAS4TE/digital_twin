@@ -16,10 +16,14 @@ A scenario folder (`config['data_path']`) is split in two:
                                 digital_twin.data_processing.profiles/.pv):
         - equipment.csv            : bus-level equipment register -- one row per
                                      equipable bus, carrying the PV sizes, the
-                                     domestic battery ids/capacities, and the
-                                     coordinates (see data_processing.equipment).
-                                     Derived from the network; it is what decides
-                                     whether the PV and BSS layers run at all.
+                                     battery ids/capacities (central b0 AND
+                                     domestic b1..bn alike), and the coordinates
+                                     (see data_processing.equipment). Derived
+                                     from the network; it is what decides
+                                     whether the PV and BSS layers run at all,
+                                     and it is now the ONLY place a battery's
+                                     bus/capacity/power is defined -- never a
+                                     runtime config key.
         - metadata.csv             : per-household attributes (profile_id,
                                      source_street, ...)
         - load_profiles.csv        : household consumption timeseries
@@ -29,9 +33,9 @@ A scenario folder (`config['data_path']`) is split in two:
         - pvgis_irradiance_quarter_hourly.parquet : required alongside
                                      equipment.csv to build `pv_profiles`
         - pv_profiles.csv          : WRITTEN FOR INSPECTION, NEVER READ BACK.
-                                     PV production per equipped bus, in kW (the
-                                     twin itself receives MW). Rebuilt on every
-                                     call; deleted when the layer is off.
+                                     PV production per equipped bus, in kW (same
+                                     unit the twin itself receives). Rebuilt on
+                                     every call; deleted when the layer is off.
         - schedules_bss.csv        : WRITTEN FOR INSPECTION, NEVER READ BACK.
                                      The battery fleet schedule, long format, kW.
                                      Same rule -- see _write_for_inspection for
@@ -96,14 +100,14 @@ def process_data(config):
 
         metadata      : pd.DataFrame          -- per-household attributes
         network       : dict                  -- network bundle (net, buses, mv_nodes, ...)
-        households    : pd.DataFrame          -- consumption timeseries, MW
-        pv_profiles   : pd.DataFrame or None  -- PV production, MW; None when no bus
+        households    : pd.DataFrame          -- consumption timeseries, kW
+        pv_profiles   : pd.DataFrame or None  -- PV production, kW; None when no bus
                                                  of the equipment table carries PV
         schedules_BSS : pd.DataFrame or None  -- battery fleet schedule, kW, long
                                                  format; None when the table carries
-                                                 no domestic battery
+                                                 no battery at all (central or domestic)
         equipment     : pd.DataFrame or None  -- the bus-level register itself; the
-                                                 twin needs it to place b1..bn and to
+                                                 twin needs it to place b0..bn and to
                                                  check the schedule's identifiers
 
     The two optional layers follow the SAME opt-in rule, on CONTENT rather than
@@ -139,7 +143,7 @@ def process_data(config):
 
 
 def _load_pv_profiles(cfg, equipment):
-    """Build `pv_profiles` (MW, see run_digital_twin) from the scenario's
+    """Build `pv_profiles` (kW, see run_digital_twin) from the scenario's
     EQUIPMENT TABLE and its cached PVGIS irradiance (utils.irradiance_path_for),
     for the month `cfg['mois_simule']`.
 
@@ -147,10 +151,9 @@ def _load_pv_profiles(cfg, equipment):
     carries PV. ACTIVATION BY PRESENCE, on content: "does any row of the table
     have pv_system_size_kwp > 0".
 
-    Also writes `pv_profiles.csv` for inspection, in **kW** -- the unit
-    build_pv_production works in. The /1000 to MW happens on the way out, so the
-    file shows kW while the twin receives MW: the conversion belongs just before
-    injection into pandapower, and a file meant for a human reads better in kW.
+    Also writes `pv_profiles.csv` for inspection, in the same kW build_pv_production
+    already works in and the twin now receives directly -- no conversion needed
+    between the two, the file matches what run_digital_twin sees.
     """
     pv_profiles_kw = None
     if (equipment is not None and len(equipment) > 0
@@ -167,6 +170,4 @@ def _load_pv_profiles(cfg, equipment):
         pv_profiles_kw = build_pv_production(cfg['mois_simule'], equipment, irradiance)
 
     _write_for_inspection(pv_profiles_kw, cfg, PV_PROFILES_FILE)
-    if pv_profiles_kw is None:
-        return None
-    return pv_profiles_kw / 1000.0  # kW -> MW, same unit as households (see run_digital_twin)
+    return pv_profiles_kw

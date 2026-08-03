@@ -11,13 +11,13 @@ materialized data files, writes a PNG and a PDF.
 DATA SOURCES
     1. load_habitation_day() -> out/processed/consumption_bank_real_weeks.parquet
        Schema: meta columns (ean_idx, ean_anon, street, month, season,
-       week_start) + 672 value columns t0000..t0671, in MW (as load_profiles.csv)
-       and converted to kW here. HAB_IDX holds `ean_idx` values -- real EAN
-       identifiers, several weeks per EAN in the bank -- NOT row positions.
+       week_start) + 672 value columns t0000..t0671, in kW (as load_profiles.csv).
+       HAB_IDX holds `ean_idx` values -- real EAN identifiers, several weeks per
+       EAN in the bank -- NOT row positions.
     2. load_mv_day() -> out/processed/mv_load_profiles.csv
        672 rows ('Mon 00:00'..'Sun 23:45'), one column per facility name (see
        data/bressoux/inputs/network.py, MV_LOADS). A SINGLE fixed weekly profile,
-       with no per-month segmentation unlike the households. MW -> kW here.
+       with no per-month segmentation unlike the households. Also kW.
 
 HOUSEHOLD SELECTION is automatic (_select_percentile_households): the 3 EANs
 whose MEDIAN weekly energy, over all their available weeks across the whole year,
@@ -61,7 +61,6 @@ plt.rcParams.update({
 FIGSIZE = (12, 11)
 N_STEPS_DAY = 96               # 24 h * 4 (quarter-hourly)
 DT_H = 0.25
-MW_TO_KW = 1000.0
 
 # --- Parameters -----------------------------------------------------------
 BANK_PATH = "data/bressoux/out/processed/consumption_bank_real_weeks.parquet"
@@ -119,7 +118,7 @@ def _select_percentile_households(ratio_threshold=PEAK_TO_MEAN_MAX,
     """
     df = pd.read_parquet(BANK_PATH)
     value_cols = [c for c in df.columns if c.startswith("t") and c[1:].isdigit()]
-    vals = df[value_cols].to_numpy(dtype=float) * MW_TO_KW
+    vals = df[value_cols].to_numpy(dtype=float)
 
     stats = df[["ean_idx"]].copy()
     with np.errstate(invalid="ignore"):  # zero-mean weeks (dead meter) -> NaN, skipped by median()
@@ -222,8 +221,8 @@ def load_habitation_day(idx, mois):
     rows, _, best_day = _get_common_week_rows(HAB_IDX, mois)
     row = rows[idx]
     value_cols = [c for c in row.index if c.startswith("t") and c[1:].isdigit()]
-    week_mw = row[value_cols].to_numpy(dtype=float)
-    return _day_slice(week_mw, best_day) * MW_TO_KW
+    week_kw = row[value_cols].to_numpy(dtype=float)
+    return _day_slice(week_kw, best_day)
 
 
 def load_mv_day(mv_name, mois):
@@ -236,8 +235,8 @@ def load_mv_day(mv_name, mois):
     """
     _, _, best_day = _get_common_week_rows(HAB_IDX, mois)
     mv = pd.read_csv(MV_PROFILES_PATH, index_col=0)
-    week_mw = mv[mv_name].to_numpy(dtype=float)
-    return _day_slice(week_mw, best_day) * MW_TO_KW
+    week_kw = mv[mv_name].to_numpy(dtype=float)
+    return _day_slice(week_kw, best_day)
 
 
 def week_energy_kwh_hab(idx, mois):
@@ -246,8 +245,8 @@ def week_energy_kwh_hab(idx, mois):
     rows, _, _ = _get_common_week_rows(HAB_IDX, mois)
     row = rows[idx]
     value_cols = [c for c in row.index if c.startswith("t") and c[1:].isdigit()]
-    week_mw = row[value_cols].to_numpy(dtype=float)
-    return float(np.sum(week_mw) * MW_TO_KW * DT_H)
+    week_kw = row[value_cols].to_numpy(dtype=float)
+    return float(np.sum(week_kw) * DT_H)
 
 
 # --- FIGURE ---------------------------------------------------------------
@@ -293,5 +292,5 @@ def build_figure():
 if __name__ == "__main__":
     fig = build_figure()
     for ext in ("png", "pdf"):
-        fig.savefig(f"scripts/viz/profils_reseau.{ext}", dpi=200, bbox_inches="tight")
-    print("Figures written: scripts/viz/profils_reseau.png / .pdf")
+        fig.savefig(f"digital_twin/plots/profils_reseau.{ext}", dpi=200, bbox_inches="tight")
+    print("Figures written: digital_twin/plots/profils_reseau.png / .pdf")

@@ -136,9 +136,11 @@ generated file.
    `config['save']` (already `True` in `main.py`) writes a Markdown run report
    (summary/violations/warnings) to `out/results/`.
 
-The steps below are only needed for the separate monthly-bank / PV
-impact-analysis tooling (`scripts/pv_impact_analysis.py`), not for the basic
-`main.py` run above:
+The steps below regenerate two files individually rather than through the
+setup notebook above; they are not needed for the basic `main.py` run once
+step 1 has been completed, but are useful for `digital_twin/plots/` (the
+consumption bank) or for tweaking the PV/battery placement (the equipment
+register):
 
 3. **Consumption bank** (every complete real calendar week from the meter
    data, tagged by month/season/street -- the month-conditioned source the
@@ -170,15 +172,16 @@ sources change).
 ## Repository layout
 
 - `digital_twin/` — the network-agnostic engine (`digital_twin.py`,
-  `run_digital_twin`, `save_run_report`), shared helpers (`utils.py`), and the
+  `run_digital_twin`, `save_run_report`), shared helpers (`utils.py`), the
   upstream data generators (`data_processing/equipment.py`,
   `data_processing/profiles.py`, `data_processing/pv.py`,
-  `data_processing/bss.py`, `data_processing/process_data.py`).
+  `data_processing/bss.py`, `data_processing/process_data.py`), and
+  `plots/` — visual-check and presentation figures, outside the production
+  pipeline (run from the repository root: their data paths are repo-root
+  relative).
 - `data/<site>/inputs/network.py` — the site-specific topology builder (NOT
   part of the installable package — this is what a new site replaces).
 - `main.py` — orchestration/demo: load a scenario's inputs, then run the twin.
-- `scripts/` — impact analysis and figures (run from the repository root: their
-  data paths are repo-root relative).
 - `docs/` — Sphinx documentation.
 - `archives/` — superseded scripts, and one-off checks whose proof is done,
   kept for reference (see `archives/README.md`).

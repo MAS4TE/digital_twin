@@ -9,13 +9,22 @@ imports the engine's format constants rather than restating them, so the two
 cannot drift.
 
 MODEL. A FLEET of physically distinct batteries, read off the scenario's
-equipment table:
-    b0     -- the CENTRAL battery at an MV node (config['bss_bus']), capacity and
-              power from config['bss_park_e_kwh'] / config['bss_park_p_kw'].
+equipment table (utils.bss_register) -- BOTH kinds are now rows of that same
+table, generated once (see data_processing.equipment.place_central_bss /
+place_bss):
+    b0     -- the CENTRAL battery at an MV node, capacity AND power read
+              directly off its own row (battery_size_kwh, battery_p_max_kw) --
+              a park cannot derive its own power from itself.
     b1..bn -- one DOMESTIC battery per equipped LV bus, capacity from the table's
-              `battery_size_kwh` column, power DERIVED from the central park's
+              `battery_size_kwh` column, power DERIVED from the central battery's
               C-rate (utils.bss_c_rate) so the fleet stays one technology at two
-              scales.
+              scales. A domestic-only fleet (no b0 row) needs an explicit
+              config['bss_c_rate'] instead -- bss_c_rate raises otherwise.
+
+ACTIVATION is fully DATA-DRIVEN, uniformly for both kinds: b0 is scheduled iff
+the equipment table carries a central-battery row, b1..bn iff it carries any
+domestic row. All four combinations (central-only, domestic-only, both,
+neither) are expressible without a flag.
 
 A domestic battery sits on its own bus and its power flows through its own LV
 feeder -- it is a physical battery in a garage, not an accounting share of the
@@ -29,19 +38,19 @@ OUTPUT FORMAT is LONG (index = week steps repeated per battery, columns
 battery_id + p_kw), because that is what carries the identifier the twin matches
 against the equipment table. See digital_twin.digital_twin's "2ter" section.
 
-UNITS. kW, positive = CHARGING (the storage convention of the twin's interface,
-see digital_twin._inject_bss_storage). `schedules_BSS` is the twin's only kW
-interface -- unlike pv.build_pv_production, whose kW are converted to MW upstream
-in process_data -- so nothing is converted here.
+UNITS. kW throughout, positive = CHARGING (the storage convention of the
+twin's interface, see digital_twin._inject_bss_storage). `households`,
+`pv_profiles` and this module's own `schedules_BSS` output are all kW at the
+twin's interface -- the kW -> MW conversion only happens inside digital_twin.py,
+right before pandapower injection -- so nothing is converted here.
 """
 import numpy as np
 import pandas as pd
 
-from ..digital_twin import (BSS_BATTERY_ID_COLUMN, BSS_CENTRAL_ID,
-                            BSS_POWER_COLUMN, _bss_domestic_register)
-from ..utils import (BSS_SOC_INIT, BSS_SOC_MIN_FRAC, STEPS_PER_DAY,
-                     STEPS_PER_WEEK, _WEEK_TIME_INDEX, _config_to_dict,
-                     bss_c_rate)
+from ..digital_twin import BSS_BATTERY_ID_COLUMN, BSS_POWER_COLUMN
+from ..utils import (BSS_CENTRAL_ID, BSS_SOC_INIT, BSS_SOC_MIN_FRAC,
+                     STEPS_PER_DAY, STEPS_PER_WEEK, _WEEK_TIME_INDEX,
+                     _config_to_dict, bss_c_rate, bss_register)
 from .equipment import BUS_TYPE_LV
 
 # No 'seed' key: the fleet comes from the equipment table and every schedule is
@@ -68,7 +77,7 @@ def _bus_load_lookup(households, metadata):
     for bus_id, pid in zip(metadata['bus_id'], metadata['profile_id']):
         col = f"profile_{pid}"
         if pd.notna(bus_id) and col in households.columns:
-            lookup[int(bus_id)] = households[col].to_numpy(dtype=float) * 1000.0
+            lookup[int(bus_id)] = households[col].to_numpy(dtype=float)
     return lookup
 
 
@@ -76,7 +85,7 @@ def _mean_load_kw(households):
     """Mean household load across the profile pool [kW] -- the FALLBACK used when
     no assignment is declared, and the shape the central battery would see if it
     had to guess."""
-    return households.mean(axis=1).to_numpy(dtype=float) * 1000.0  # MW -> kW
+    return households.mean(axis=1).to_numpy(dtype=float)
 
 
 def _pv_kw(pv_profiles, bus_id, n_steps):
@@ -90,7 +99,7 @@ def _pv_kw(pv_profiles, bus_id, n_steps):
     col = f"pv_{int(bus_id)}"
     if col not in pv_profiles.columns:
         return np.zeros(n_steps, dtype=float)
-    return pv_profiles[col].to_numpy(dtype=float)[:n_steps] * 1000.0  # MW -> kW
+    return pv_profiles[col].to_numpy(dtype=float)[:n_steps]
 
 
 def _schedule_one_battery(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
@@ -167,50 +176,46 @@ def _schedule_one_battery(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta)
     return p_kw
 
 
-def build_bss_schedule(households, pv_profiles, equipment, metadata=None,
-                       config=None, include_central=True):
+def build_bss_schedule(households, pv_profiles, equipment, metadata=None, config=None):
     """Build `schedules_BSS` in LONG format for the scenario's whole fleet.
 
     Parameters
     ----------
-    households : pd.DataFrame   # consumption timeseries, MW
+    households : pd.DataFrame   # consumption timeseries, kW
     pv_profiles : pd.DataFrame or None
-        PV production, MW, columns 'pv_{bus_id}'. None, or a bus with no PV,
+        PV production, kW, columns 'pv_{bus_id}'. None, or a bus with no PV,
         means no surplus term for that battery.
     equipment : pd.DataFrame    # the bus-level register (bus_id, battery_id,
-        battery_size_kwh) -- the fleet's placement and sizing, see
-        data_processing.equipment.
+        battery_size_kwh, battery_p_max_kw) -- the fleet's placement and sizing,
+        central battery (b0) included, see data_processing.equipment.
     metadata : pd.DataFrame or None
         Household table carrying the declared household -> bus assignment
         (`bus_id`). When given, EACH domestic battery is scheduled against the
         load of ITS OWN bus. Without it, every battery falls back to the pool
         mean and plans against a load its bus will never see.
     config : dict or None
-        Reads bss_park_e_kwh, bss_park_p_kw, bss_c_rate, bss_eta, q_charge,
-        q_discharge. `bss_eta` is the SAME key the engine uses -- planning
-        against a different efficiency than the twin applies is what makes a
-        schedule drift.
-    include_central : bool
-        Whether to schedule b0 alongside the domestic batteries. False yields a
-        purely domestic fleet, which the twin accepts (no storage is then created
-        on config['bss_bus']).
+        Reads bss_c_rate, bss_eta, q_charge, q_discharge. `bss_eta` is the SAME
+        key the engine uses -- planning against a different efficiency than the
+        twin applies is what makes a schedule drift.
 
     Returns
     -------
     schedules_BSS : pd.DataFrame
         Index = the labelled weekly index matching `households`, repeated once
-        per battery; columns 'battery_id' and 'p_kw'. b0 first, then b1..bn.
-        The labelled index (rather than a bare RangeIndex) is what lets the
-        engine's [BSS/align] check verify alignment instead of trusting the
-        provider.
+        per battery; columns 'battery_id' and 'p_kw'. b0 first (when present),
+        then b1..bn. The labelled index (rather than a bare RangeIndex) is what
+        lets the engine's [BSS/align] check verify alignment instead of
+        trusting the provider.
     """
     cfg = {**DEFAULTS, **_config_to_dict(config)}
 
-    register = _bss_domestic_register(equipment)
-    if not register and not include_central:
+    full_register = bss_register(equipment)
+    central = full_register.get(BSS_CENTRAL_ID)
+    domestic = {b: v for b, v in full_register.items() if b != BSS_CENTRAL_ID}
+    if central is None and not domestic:
         raise ValueError(
-            "Nothing to schedule: the equipment table carries no domestic battery "
-            "and include_central=False."
+            "Nothing to schedule: the equipment table carries no battery (neither a "
+            "central b0 row nor any domestic b1..bn row)."
         )
 
     mean_load_kw = _mean_load_kw(households)
@@ -221,7 +226,7 @@ def build_bss_schedule(households, pv_profiles, equipment, metadata=None,
 
     series = {}
 
-    if include_central:
+    if central is not None:
         # The central battery answers to the WHOLE neighbourhood's net load, so
         # its signal is the aggregate: the representative household load times
         # the number of LV buses, minus all the PV. MV load facilities are not in
@@ -245,17 +250,18 @@ def build_bss_schedule(households, pv_profiles, equipment, metadata=None,
         # sum stays correct if that stops holding.
         agg_load_kw = (np.sum(list(bus_load.values()), axis=0) if bus_load
                        else mean_load_kw * n_lv)
-        agg_pv_kw = (pv_profiles.sum(axis=1).to_numpy(dtype=float)[:n_steps] * 1000.0
+        agg_pv_kw = (pv_profiles.sum(axis=1).to_numpy(dtype=float)[:n_steps]
                      if pv_profiles is not None else np.zeros(n_steps, dtype=float))
         series[BSS_CENTRAL_ID] = _schedule_one_battery(
-            agg_load_kw - agg_pv_kw, float(cfg['bss_park_e_kwh']),
-            float(cfg['bss_park_p_kw']), q_charge, q_discharge, eta)
+            agg_load_kw - agg_pv_kw, central['e_kwh'], central['p_max_kw'],
+            q_charge, q_discharge, eta)
 
-    # A domestic battery's rating follows the central park's C-rate (see
-    # utils.bss_c_rate), keeping the fleet one technology at two scales.
-    c_rate = bss_c_rate(cfg)
-    for battery_id in sorted(register, key=lambda i: int(i[1:])):
-        entry = register[battery_id]
+    # A domestic battery's rating follows the central battery's C-rate (see
+    # utils.bss_c_rate), keeping the fleet one technology at two scales -- or an
+    # explicit config['bss_c_rate'] override for a domestic-only fleet.
+    c_rate = bss_c_rate(cfg, equipment) if domestic else None
+    for battery_id in sorted(domestic, key=lambda i: int(i[1:])):
+        entry = domestic[battery_id]
         e_kwh = float(entry['e_kwh'])
         # ITS OWN bus's load, not the pool average -- a home battery arbitrages
         # the household it sits behind. Falls back to the mean only when no
@@ -277,16 +283,14 @@ def load_bss_schedule(households, pv_profiles, equipment, metadata=None, config=
     """Build the fleet schedule from the scenario's equipment table, or None.
 
     ACTIVATION BY PRESENCE, exactly as process_data._load_pv_profiles does for
-    PV: the carrier is the table's CONTENT (any row with battery_size_kwh > 0),
-    not the existence of a file.
-
-    A scenario wanting the central battery ALONE supplies its own schedule --
-    this module is a test harness, not the production source.
+    PV: the carrier is the table's CONTENT (any row with battery_size_kwh > 0,
+    central b0 or domestic b1..bn alike), not the existence of a file. A
+    central-only scenario is reachable through this automatic path.
 
     Returns
     -------
     schedules_BSS : pd.DataFrame or None   # long format, kW
     """
-    if not _bss_domestic_register(equipment):
+    if not bss_register(equipment):
         return None
     return build_bss_schedule(households, pv_profiles, equipment, metadata, config)

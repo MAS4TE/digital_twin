@@ -10,6 +10,11 @@ This page documents the schema of each generated file. See
 [Load assignment](load_assignment.md) and [PV modelling](pv_modelling.md) for
 the functions that read and write them.
 
+Schemas below are shown for the base `data/bressoux/out/processed/` scenario,
+but the SAME schemas apply verbatim under each electrification scenario
+folder, `data/bressoux/scenarios/<name>/out/processed/` -- see
+[Electrification scenarios](electrification_scenarios.md).
+
 ## `out/processed/equipment.csv`
 
 The **bus-level equipment register**: one row per bus that can carry equipment,
@@ -34,28 +39,32 @@ be half-described.
 | Column               | Type              | Description                                                       |
 |----------------------|-------------------|-------------------------------------------------------------------|
 | `bus_id`             | `int64`           | Target bus in the pandapower network.                             |
-| `bus_type`           | `str`             | `"lv_residential"` or `"mv_load"` (a facility connected at MV).    |
-| `name`               | `str`             | Bus name in the network, or the facility name.                     |
-| `street`, `num`      | `str` or `NA`     | Address of the LV bus; `NA` for MV load facilities.                |
+| `bus_type`           | `str`             | `"lv_residential"`, `"mv_load"` (a facility connected at MV), or `"mv_node"` (any other MV node -- the slack, the substations; the only domain the central battery may sit on). |
+| `name`               | `str`             | Bus name in the network, or the facility/node name.                 |
+| `street`, `num`      | `str` or `NA`     | Address of the LV bus; `NA` for MV buses.                          |
 | `lon`, `lat`         | `float64`         | Coordinates, read from the network's GeoJSON `geo` column.         |
 | `pv_system_size_kwp` | `Float64`         | Installed PV peak power (kWp); `0` when the bus carries none.       |
-| `battery_id`         | `string` or `NA`  | `b1`…`bn`, in ascending `bus_id` order (see below).                 |
-| `battery_size_kwh`   | `Float64`         | Domestic battery capacity (kWh); `0` when the bus carries none.     |
+| `battery_id`         | `string` or `NA`  | `b0` (central) or `b1`…`bn` (domestic, ascending `bus_id` order).    |
+| `battery_size_kwh`   | `Float64`         | Battery capacity (kWh) -- central or domestic alike; `0` when none.  |
+| `battery_p_max_kw`   | `Float64`         | Explicit power rating; meaningful **only** on the central battery's row (`battery_id == "b0"`) -- a domestic battery's power is DERIVED (`battery_size_kwh × bss_c_rate(...)`), never stored, so the two numbers can't drift apart. |
 | `heat_pump`          | `boolean`         | MAS4TE schema field, defaults to `False`.                          |
 | `electric_vehicle`   | `boolean`         | MAS4TE schema field, defaults to `False`.                          |
 
 ```{code-block} text
-bus_id,bus_type,name,street,num,lon,lat,pv_system_size_kwp,battery_id,battery_size_kwh,heat_pump,electric_vehicle
-9,lv_residential,Malvoz 12,Rue Ernest Malvoz,12,5.6058,50.6393,3.0,,0.0,False,False
-13,lv_residential,Malvoz 20,Rue Ernest Malvoz,20,5.6061,50.6395,3.0,b1,10.0,False,False
-5,mv_load,Paradis du Bouhay,,,5.6042,50.6401,12.0,,0.0,False,False
+bus_id,bus_type,name,street,num,lon,lat,pv_system_size_kwp,battery_id,battery_size_kwh,battery_p_max_kw,heat_pump,electric_vehicle
+3,mv_node,MALVOZ BRESSOUX,,,5.6060,50.6392,0.0,b0,2600.0,595.0,False,False
+9,lv_residential,Malvoz 12,Rue Ernest Malvoz,12,5.6058,50.6393,3.0,,0.0,0.0,False,False
+13,lv_residential,Malvoz 20,Rue Ernest Malvoz,20,5.6061,50.6395,3.0,b1,10.0,0.0,False,False
+5,mv_load,Paradis du Bouhay,,,5.6042,50.6401,12.0,,0.0,0.0,False,False
 ```
 
-`battery_id` is assigned deterministically in ascending `bus_id` order, so the
-same table always yields the same identifiers — that is what the schedule's
-`b1`…`bn` are matched against. **`b0` is never a row of this table**: it is the
-central battery, sits on an MV node, and its placement and size come from
-`config['bss_bus']`, `config['bss_park_e_kwh']` and `config['bss_park_p_kw']`.
+`battery_id` is assigned deterministically -- `b0` by `place_central_bss` (see
+[BSS modelling](bss_modelling.md)), `b1`…`bn` in ascending `bus_id` order by
+`place_bss` -- so the same table always yields the same identifiers, which is
+what the schedule's `battery_id` column is matched against. **`b0` IS a row of
+this table**: unlike PV/domestic batteries, it is opt-in by
+`config['bss_bus']` presence at generation time (an MV node name or bus id --
+absent means no central battery), not drawn.
 
 ```{note}
 The equipment columns deliberately reuse the MAS4TE **household** schema names
@@ -127,7 +136,7 @@ EAN week per profile from the sub-bank of the simulated month (see
 | Column            | Type      | Description                                        |
 |--------------------|-----------|------------------------------------------------------|
 | `week_step`        | `str`     | Index: `'Mon 00:00'..'Sun 23:45'`, 672 quarter-hourly steps. |
-| `profile_{id}`     | `float64` | Active power (MW), one column per `metadata.csv` row. |
+| `profile_{id}`     | `float64` | Active power (kW), one column per `metadata.csv` row. |
 
 ## `out/processed/pv_profiles.csv` and `schedules_bss.csv`
 
@@ -142,13 +151,11 @@ not as a cache.
 | `pv_profiles.csv` | 672 × n_equipped | **kW** | one column `pv_{bus_id}` per bus carrying PV |
 | `schedules_bss.csv` | (672 × n_batteries) × 2 | **kW** | long format: `battery_id`, `p_kw` |
 
-```{warning}
-`pv_profiles.csv` is in **kW**, while `run_digital_twin` receives `pv_profiles`
-in **MW**. The `/1000` is applied on the way out of `_load_pv_profiles`, just
-before injection into pandapower. The asymmetry is deliberate — kW is the
-readable unit and the one `build_pv_production` works in — but it means the file
-does *not* show the numbers the power flow sees, off by a factor 1000.
-`schedules_bss.csv` has no such gap: kW is the twin's own interface unit for it.
+```{note}
+`pv_profiles.csv` and `schedules_bss.csv` are both in **kW**, matching what
+`run_digital_twin` itself receives for `pv_profiles`/`schedules_BSS` -- no
+conversion between the file and the twin's interface. The `/1000` to MW only
+happens inside `digital_twin.py`, right before pandapower injection.
 ```
 
 ```{note}
@@ -172,7 +179,7 @@ historical `profil_conso.ipynb`).
 | Column                | Type      | Description                                  |
 |------------------------|-----------|-------------------------------------------------|
 | `week_step`            | `str`     | Index: `'Mon 00:00'..'Sun 23:45'`, 672 steps.   |
-| `Paradis du Bouhay`, `Plantations`, `Omnisport BX`, `Groupe Scolaire` | `float64` | Active power (MW) per facility. |
+| `Paradis du Bouhay`, `Plantations`, `Omnisport BX`, `Groupe Scolaire` | `float64` | Active power (kW) per facility. |
 
 ## `out/processed/consumption_bank_real_weeks.parquet`
 
@@ -180,7 +187,7 @@ The bank of real weekly consumption profiles (1345 rows × 678 columns), one row
 per complete calendar week of a retained EAN. Produced by
 `build_consumption_bank` (see [Load assignment](load_assignment.md)) -- the
 month-conditioned source every `households` draw reads from, including
-`pv.run_pv_scenario` / `scripts/pv_impact_analysis.py`.
+`pv.run_pv_scenario` and `digital_twin/plots/plot_profils_reseau.py`.
 
 | Column          | Type                     | Description                                        |
 |-----------------|--------------------------|----------------------------------------------------|
@@ -190,11 +197,11 @@ month-conditioned source every `households` draw reads from, including
 | `month`         | `int64` (1–12)           | Month of the week's start.                         |
 | `season`        | `str`                    | Season label (e.g. `"Automne"`).                   |
 | `week_start`    | `str` (ISO, UTC)         | Start timestamp of the calendar week.              |
-| `t0000`…`t0671` | `float64` (MW)           | 672 quarter-hourly consumption values (Mon→Sun).   |
+| `t0000`…`t0671` | `float64` (kW)           | 672 quarter-hourly consumption values (Mon→Sun).   |
 
 ```{note}
 The `t0000..t0671` columns are the week's 672 quarter-hourly steps (7 days ×
-96 steps), in **MW**, ordered Monday 00:00 to Sunday 23:45 — the same temporal
+96 steps), in **kW**, ordered Monday 00:00 to Sunday 23:45 — the same temporal
 layout used everywhere else in the pipeline.
 ```
 
@@ -225,9 +232,10 @@ produces a step profile. See the conversion note in
 
 ```{code-block} bash
 jupyter execute data/bressoux/bressoux_setup.ipynb   # metadata, load_profiles,
-                                                       # mv_load_profiles, irradiance
+                                                       # mv_load_profiles, irradiance,
+                                                       # equipment.csv, electrification scenarios
 python -m digital_twin.data_processing.profiles       # (alternative) bank + irradiance parquets
-python -c "from digital_twin.data_processing.equipment import generate_equipment_table; generate_equipment_table({'data_path': 'data/bressoux'})"
+python -c "from digital_twin.data_processing.equipment import generate_equipment_table; generate_equipment_table({'data_path': 'data/bressoux', 'bss_bus': 'MALVOZ BRESSOUX', 'bss_park_e_kwh': 2600.0, 'bss_park_p_kw': 595.0})"
 ```
 
 ```{note}

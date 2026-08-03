@@ -13,9 +13,9 @@ WHAT COMES FROM WHERE
       network -- no draw, no scenario choice, reproducible from inputs/network.py
       alone. Nothing here is Bressoux-specific: it reads only network['buses'],
       network['mv_nodes'], network['mv_load_names'] and net.bus.
-    * the equipment columns (pv_system_size_kwp, battery_size_kwh, heat_pump,
-      electric_vehicle) are a scenario DECISION, filled by the placement layer
-      below. The network cannot know them.
+    * the equipment columns (pv_system_size_kwp, battery_size_kwh,
+      battery_p_max_kw, heat_pump, electric_vehicle) are a scenario DECISION,
+      filled by the placement layer below. The network cannot know them.
 
 COLUMN NAMING. The equipment columns deliberately reuse the MAS4TE household
 schema names (see profiles.MAS4TE_METADATA_COLUMNS): `battery_size_kwh` and
@@ -23,12 +23,14 @@ schema names (see profiles.MAS4TE_METADATA_COLUMNS): `battery_size_kwh` and
 this bus-level table and the household file is then obvious, which is what the
 metadata<->schedule coherence check needs.
 
-BATTERY IDENTIFIERS. `battery_id` is b1..bn, assigned in ascending bus_id order
-so the mapping is stable across runs. **b0 is NOT in this table**: it is the
-CENTRAL battery, sitting on an MV node, and its placement and size already have
-their own config keys (bss_bus / bss_park_e_kwh / bss_park_p_kw). This table is
-about batteries that live on a bus of the distribution grid; the central one is
-injected "in addition to" them (see digital_twin._inject_bss_storage).
+BATTERY IDENTIFIERS. `battery_id` is b0..bn: b0 is the CENTRAL battery (see
+place_central_bss), b1..bn are DOMESTIC batteries (place_bss), assigned in
+ascending bus_id order so the mapping is stable across runs. Both kinds are now
+ROWS of this same table, generated once -- b0's power is stored explicitly
+(`battery_p_max_kw`, only meaningful on its row) because, unlike a domestic
+battery, it cannot derive its own rating from a shared C-rate (see
+utils.bss_c_rate). Placement never collides: b0 only ever sits on an 'mv_node'/
+'mv_load' bus, b1..bn only ever on 'lv_residential' ones.
 
 ROWS ARE NOT ALL EQUIPABLE THE SAME WAY. `bus_type` separates:
     * 'lv_residential' -- the 333 LV charge buses. PV and domestic batteries.
@@ -38,20 +40,25 @@ ROWS ARE NOT ALL EQUIPABLE THE SAME WAY. `bus_type` separates:
                           and it has no LV bus of its own. A DOMESTIC battery on
                           an MV bus is a placement error, which is exactly the
                           distinction the bus_id contract has to enforce.
+    * 'mv_node'        -- every other MV node (the slack, the substations). Not
+                          PV/battery-equipable by the residential/facility rules
+                          above -- the ONLY domain the CENTRAL battery may sit
+                          on (see place_central_bss).
 """
 import os
 
 import numpy as np
 import pandas as pd
 
-from ..utils import (BSS_ID_COLUMN as BATTERY_ID_COLUMN, BSS_SIZE_COLUMN,
-                     _config_to_dict, bus_lonlat, load_site_network)
+from ..utils import (BSS_CENTRAL_ID, BSS_ID_COLUMN as BATTERY_ID_COLUMN,
+                     BSS_P_MAX_COLUMN, BSS_SIZE_COLUMN, _config_to_dict,
+                     bus_lonlat, load_site_network)
 
 EQUIPMENT_TABLE_FILE = "equipment.csv"
 
 # Column names shared with the MAS4TE household schema, exported so consumers
 # (pv.build_pv_production, the BSS layer) name them once instead of repeating a
-# string literal that could drift from the table. The two BSS ones are DEFINED in
+# string literal that could drift from the table. The BSS ones are DEFINED in
 # utils and re-exported here: the engine has to name them too, and it cannot
 # import this package back (see utils.BSS_ID_COLUMN for why).
 PV_SIZE_COLUMN = 'pv_system_size_kwp'
@@ -62,12 +69,18 @@ EQUIPMENT_COLUMNS = {
     PV_SIZE_COLUMN:     ('Float64', 0.0),
     BATTERY_ID_COLUMN:  ('string', pd.NA),
     BSS_SIZE_COLUMN:    ('Float64', 0.0),
+    BSS_P_MAX_COLUMN:   ('Float64', 0.0),   # meaningful only on the central battery's
+                                              # row (b0) -- see utils.BSS_P_MAX_COLUMN
     'heat_pump':        ('boolean', False),
     'electric_vehicle': ('boolean', False),
 }
 
 BUS_TYPE_LV = 'lv_residential'
 BUS_TYPE_MV_LOAD = 'mv_load'
+BUS_TYPE_MV_NODE = 'mv_node'    # any MV node that is NOT one of the mv_load
+                                  # facilities (the slack, the substations). The
+                                  # only domain the CENTRAL battery may sit on --
+                                  # see place_central_bss.
 
 # SITE-CALIBRATED values do NOT belong here. `street_weights` (a field-report
 # tendency observed on one street of Bressoux) and `mv_pv_installations` (named
@@ -134,12 +147,29 @@ def build_equipment_skeleton(network):
         })
 
     # MV load facilities: equipable (PV), but never with a DOMESTIC battery.
+    mv_load_buses = set()
     for facility in network['mv_load_names']:
         b = network['mv_nodes'][facility]
+        mv_load_buses.add(int(b))
         lon, lat = bus_lonlat(net, b)
         rows.append({
             'bus_id': int(b), 'bus_type': BUS_TYPE_MV_LOAD,
             'name': facility, 'street': pd.NA, 'num': pd.NA,
+            'lon': lon, 'lat': lat,
+        })
+
+    # Every OTHER MV node (the slack, the substations): not PV/battery-equipable
+    # by the residential/facility placement rules, but the ONLY domain the
+    # CENTRAL battery may sit on (see place_central_bss) -- a row here is what
+    # lets that placement be checked by bus_id like everything else, instead of
+    # trusting an unchecked config value.
+    for name, b in network['mv_nodes'].items():
+        if int(b) in mv_load_buses:
+            continue
+        lon, lat = bus_lonlat(net, b)
+        rows.append({
+            'bus_id': int(b), 'bus_type': BUS_TYPE_MV_NODE,
+            'name': name, 'street': pd.NA, 'num': pd.NA,
             'lon': lon, 'lat': lat,
         })
 
@@ -318,7 +348,8 @@ def extend_pv(table, n_additional, config=None, rng=None):
     This is what makes penetration rates comparable: a 30 -> 50 comparison must
     isolate the RATE effect, so the 50-fleet has to contain the 30-fleet. An
     independent re-draw would mix rate and placement and make the delta
-    uninterpretable. Used by scripts/pv_impact_analysis.py.
+    uninterpretable. Used by data/bressoux/resflex_scenarios.py to build each
+    electrification scenario's PV fleet off the base equipment table.
 
     Same clustering spirit as place_pv, in two stages:
       1. fill the already-equipped streets first, in proportion to their
@@ -388,7 +419,8 @@ def place_bss(table, config=None, rng=None):
 
     `battery_id` is assigned b1..bn in ascending bus_id order -- deterministic,
     so the same table always yields the same identifiers, and b0 stays free for
-    the central battery (which is not a row of this table).
+    the central battery (see place_central_bss, called separately -- LV buses
+    are never eligible for it, so the two placements can never collide).
 
     Mutates and returns `table`.
     """
@@ -407,13 +439,75 @@ def place_bss(table, config=None, rng=None):
                if cfg["batteries_follow_pv"] else "Domestic batteries")))
     equipped = table['bus_id'].isin(chosen)
     table.loc[equipped, BSS_SIZE_COLUMN] = cfg["battery_kwh"]
-    # b1..bn: b0 is reserved for the central MV battery, which this table does
-    # not describe (see the module docstring). Assigned in ascending bus_id order
-    # (`chosen` is sorted), so the same table always yields the same identifiers
-    # -- the schedule's b1..bn are matched against them by SET in
-    # digital_twin._validate_inputs.
+    # b1..bn: b0 is reserved for the central battery (see place_central_bss).
+    # Assigned in ascending bus_id order (`chosen` is sorted), so the same table
+    # always yields the same identifiers -- the schedule's b1..bn are matched
+    # against them by SET in digital_twin._validate_inputs.
     table.loc[equipped, BATTERY_ID_COLUMN] = pd.array(
         [f"b{i}" for i in range(1, len(chosen) + 1)], dtype='string')
+    return table
+
+
+def place_central_bss(table, config=None, rng=None):
+    """Fill `battery_id='b0'`, `battery_size_kwh` and `battery_p_max_kw` on the
+    ONE mv_node/mv_load row named by `cfg['bss_bus']` -- the CENTRAL battery.
+
+    OPT-IN by `cfg['bss_bus']` presence, exactly like `mv_pv_installations`/
+    `street_weights`: SITE-CALIBRATED (which MV node, what park), not a default
+    of this module (see DEFAULTS' docstring) -- no key means no central battery,
+    `table` returned unchanged. This is what makes a domestic-only scenario
+    expressible without a flag to disable something.
+
+    `cfg['bss_park_e_kwh']`/`cfg['bss_park_p_kw']` are then REQUIRED and
+    validated (> 0) as soon as `bss_bus` is set: unlike a domestic battery, the
+    central one has no C-rate fallback to derive its own power from (see
+    utils.bss_c_rate), so half-configuring it is a generation-time error, not a
+    silent default.
+
+    `rng` accepted for interface symmetry with place_pv/place_bss; unused today
+    (no draw -- `bss_bus` names an exact node).
+
+    Raises
+    ------
+    ValueError
+        `cfg['bss_bus']` matches zero or more than one row of
+        `bus_type in {mv_node, mv_load}`, or `bss_park_e_kwh`/`bss_park_p_kw` is
+        missing or non-positive.
+
+    Mutates and returns `table`.
+    """
+    cfg = {**DEFAULTS, **(config or {})}
+    bss_bus = cfg.get('bss_bus')
+    if bss_bus is None:
+        return table
+
+    candidates = table[table['bus_type'].isin([BUS_TYPE_MV_NODE, BUS_TYPE_MV_LOAD])]
+    if isinstance(bss_bus, str):
+        match = candidates[candidates['name'] == bss_bus]
+    else:
+        match = candidates[candidates['bus_id'] == int(bss_bus)]
+    if len(match) != 1:
+        raise ValueError(
+            f"config['bss_bus'] = {bss_bus!r} does not match exactly one MV node of "
+            f"this network. Available: {sorted(candidates['name'])}."
+        )
+
+    e_kwh, p_kw = cfg.get('bss_park_e_kwh'), cfg.get('bss_park_p_kw')
+    if not e_kwh or float(e_kwh) <= 0:
+        raise ValueError(
+            f"config['bss_park_e_kwh'] ({e_kwh}) must be a positive number when "
+            "config['bss_bus'] is set."
+        )
+    if not p_kw or float(p_kw) <= 0:
+        raise ValueError(
+            f"config['bss_park_p_kw'] ({p_kw}) must be a positive number when "
+            "config['bss_bus'] is set."
+        )
+
+    idx = match.index
+    table.loc[idx, BATTERY_ID_COLUMN] = pd.array([BSS_CENTRAL_ID], dtype='string')
+    table.loc[idx, BSS_SIZE_COLUMN] = float(e_kwh)
+    table.loc[idx, BSS_P_MAX_COLUMN] = float(p_kw)
     return table
 
 
@@ -464,8 +558,10 @@ def equipment_table_path(data_path):
 def generate_equipment_table(config=None, out_path=None, write=True):
     """Build the scenario's equipment table end to end and write it.
 
-    Skeleton from the network, then PV placement, then battery placement (which
-    reads the PV column, hence the order). ONE seeded generator for both draws,
+    Skeleton from the network, then PV placement, then domestic battery
+    placement (which reads the PV column, hence the order), then the central
+    battery (opt-in by cfg['bss_bus'], see place_central_bss -- independent of
+    the other two, order doesn't matter). ONE seeded generator for all draws,
     so the whole placement is reproducible from cfg['seed'] alone.
 
     Returns
@@ -484,6 +580,7 @@ def generate_equipment_table(config=None, out_path=None, write=True):
     table = build_equipment_skeleton(network)
     table = place_pv(table, cfg, rng=rng)
     table = place_bss(table, cfg, rng=rng)
+    table = place_central_bss(table, cfg, rng=rng)
 
     if write:
         if out_path is None:
