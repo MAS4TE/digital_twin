@@ -14,7 +14,7 @@ prints), a garder pour re-tester si le modele change.
 import numpy as np
 import pandas as pd
 
-from sourcecode.pv_production import (
+from digital_twin.data_processing.pv import (
     build_pv_production, DEFAULT_SYSTEM_FACTOR, STEPS_PER_DAY, PV_INSTALLATIONS_PATH, IRRADIANCE_PATH,
 )
 

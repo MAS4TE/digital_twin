@@ -2,18 +2,25 @@
 
 ## 1. Data ingestion
 
-- **Smart-meter data** (`data/part-*.csv`): anonymized EAN (metering point)
-  readings, including the street address and the substation ("cabine") each
-  meter is attached to.
-- **Coordinates** (`data/coordonnées.csv`): GPS coordinates of the buildings
-  in Bressoux, matched to house numbers.
+- **Smart-meter data** (`data/bressoux/inputs/part-*.csv`): anonymized EAN
+  (metering point) readings, including the street address and the substation
+  ("cabine") each meter is attached to.
+- **Coordinates** (`data/bressoux/inputs/coordinates.csv`): GPS coordinates of
+  the buildings in Bressoux, matched to house numbers.
 - EANs with less than one year of metered consumption are discarded to avoid
   building the network from too short a history.
-- From the retained meters, a bank of **real weekly consumption profiles** is
-  built (`data/consumption_bank_real_weeks.parquet`), from which
-  `load_profiles` is later generated. See [Load assignment](load_assignment.md).
+- From the retained meters, the `households` timeseries is drawn from a bank of
+  **real weekly consumption profiles** built at
+  `data/bressoux/out/processed/consumption_bank_real_weeks.parquet`, conditioned
+  on the simulated month. See [Load assignment](load_assignment.md).
 
 ## 2. Network reconstruction
+
+This step is a **caller-supplied input** to `run_digital_twin` (the
+`network` argument), built by a site-specific `inputs/network.py` (e.g.
+[data/bressoux/inputs/network.py](../data/bressoux/inputs/network.py)) rather
+than by the engine itself — see [Interfacing](interfacing.md#the-network-input).
+The description below is specific to the Bressoux site.
 
 - The network is organised in two voltage levels: **LV buses** (0.4 kV,
   one per household) and **MV buses** (15 kV).
@@ -21,7 +28,7 @@
   - **Substations** ("cabines": Troulouette, Cimetière Bressoux, Malvoz
     Bressoux, Grottes), each connected to its LV side through a single
     **MV/LV transformer** that feeds the surrounding LV households.
-  - **Passage nodes** (Paradis du Bouhay, Plantations, Omnisport BX, Groupe
+  - **MV load nodes** (Paradis du Bouhay, Plantations, Omnisport BX, Groupe
     Scolaire), which structure the MV feeder and carry their own load directly
     at the MV level (large consumers connected in medium voltage, without a
     dedicated transformer). Three of them are extracted from the coordinate
@@ -47,14 +54,15 @@
 
 ## 3. Load assignment
 
-Consumption profiles reach the buses in two decoupled stages: a
-`load_profiles.csv` is **generated upstream** from a bank of real weeks, then
-`run_digital_twin` **receives** it and its assignment step maps the profiles
-onto the load buses (light street-based association; orphan buses without
-meters draw from the whole set and are flagged). Reactive power uses a fixed
-residential power factor (cos φ = 0.95); profiles are at a 15-minute step in
-MW/MVAr. No shift/scale perturbation is applied — diversity comes from the real
-weeks themselves. See [Load assignment](load_assignment.md) for the details.
+Consumption profiles reach the buses in two decoupled stages: a scenario's
+`out/processed/load_profiles.csv` is **generated upstream** (see
+[Load assignment](load_assignment.md)), then `run_digital_twin` **receives** it
+(as `households`) and its assignment step maps the profiles onto the load buses.
+The mapping is a lookup, not a draw: `metadata['bus_id']` declares it 1:1, and a
+caller supplying no such column falls back to a seeded draw with a warning.
+Reactive power uses a fixed residential power factor (cos φ = 0.95); profiles
+are at a 15-minute step, in kW at the `households` interface and converted to
+MW/MVAr internally, right before assignment.
 
 ## 4. Time-series power flow
 
@@ -71,15 +79,19 @@ weeks themselves. See [Load assignment](load_assignment.md) for the details.
 
 ## 5. Results and visualisation
 
-- Time-series results (voltages, loadings) can be written to CSV under
-  `outputs/`, and the aggregated verdict is returned by `run_digital_twin`.
+- The aggregated verdict (summary + violations + warnings) is returned by
+  `run_digital_twin` as a single long-format DataFrame.
+- `save_run_report(out, out_path)` (`digital_twin/digital_twin.py`) renders
+  that DataFrame as a human-readable Markdown report; `main.py` writes it to
+  `data/bressoux/out/results/` when `config['save']` is `True`.
 - Results can be inspected at any time step and plotted on a map to visualise
   voltage levels and line loading across the neighbourhood.
 
 ## 6. Packaging as a digital twin function
 
-The steps above are consolidated into `run_digital_twin`
-(`sourcecode/digital_twin.py`), which takes its inputs (configuration,
-households, load and PV profiles, battery schedules) as plain `pandas`
-DataFrames and returns a single DataFrame with the resulting summary verdict,
-violations and warnings — see [Interfacing](interfacing.md).
+Steps 3-5 are consolidated into `run_digital_twin`
+(`digital_twin/digital_twin.py`), a network-agnostic engine that takes its
+inputs (configuration, household metadata, the network bundle from step 2,
+consumption/PV profiles, battery schedules) and returns a single DataFrame
+with the resulting summary verdict, violations and warnings — see
+[Interfacing](interfacing.md).

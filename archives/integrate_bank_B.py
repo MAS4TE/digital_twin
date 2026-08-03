@@ -2,7 +2,7 @@
 Comparaison "actuelle" vs "banque_mensuelle" (integrate-bank-B) : effet de la
 nouvelle methode d'affectation des profils de charge (vraies semaines EAN,
 segmentees par mois -- cf. explore_seasonal_pv.py) sur les resultats du power
-flow complet (sourcecode.digital_twin.run_digital_twin), pour un mois d'hiver
+flow complet (digital_twin.digital_twin.run_digital_twin), pour un mois d'hiver
 et un mois d'ete.
 
 Contexte : "actuelle" tire dans la banque plate de 350 profils deja
@@ -13,7 +13,7 @@ identiques par construction, c'est justement ce que banque_mensuelle corrige).
 sous-banque du mois choisi, sans shift/scale.
 
 Prerequis : data/consumption_bank_real_weeks.parquet materialise (executer
-`python sourcecode/consumption_bank.py` si absent -- digital_twin.py leve une
+`python digital_twin/consumption_bank.py` si absent -- digital_twin.py leve une
 erreur explicite sinon).
 
 Ne modifie aucune donnee source. Lit uniquement households.csv/load_profiles.csv
@@ -30,7 +30,7 @@ import matplotlib
 matplotlib.use("Agg")  # cf. incident recurrent matplotlib/savefig sur cette machine
 import matplotlib.pyplot as plt
 
-from sourcecode.digital_twin import run_digital_twin, CONSUMPTION_BANK_FILE
+from digital_twin.digital_twin import run_digital_twin, CONSUMPTION_BANK_FILE
 
 DATA_PATH = "data/"
 OUT_DIR = "outputs_integrate_B"
@@ -39,7 +39,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 bank_path = DATA_PATH + CONSUMPTION_BANK_FILE
 if not os.path.exists(bank_path):
     raise FileNotFoundError(
-        f"{bank_path} introuvable. Executer `python sourcecode/consumption_bank.py` "
+        f"{bank_path} introuvable. Executer `python digital_twin/consumption_bank.py` "
         "avant de lancer cette comparaison."
     )
 

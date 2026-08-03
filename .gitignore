@@ -1,9 +1,11 @@
-/data
-/outputs*
 .DS_Store
 /docs/_build
 __pycache__/
-*.pyc
-scripts/viz/*.pdf
-scripts/viz/*.png
-NEXT_STEPS.md
+data/bressoux/inputs/
+data/bressoux/out/
+data/bressoux/scenarios/
+__MACOSX/
+digital_twin/plots/*.pdf
+digital_twin/plots/*.png
+digital_twin.egg-info
+.claude

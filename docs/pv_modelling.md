@@ -15,12 +15,13 @@ not hold the Bressoux field data themselves — the twin only ever *receives*
 
 ```{mermaid}
 flowchart LR
-    M[generate_pv_metadata] --> C[(pv_installations.csv)]
-    A[(PVGIS irradiance)] --> P(build_pv_production)
+    N[(inputs/network.py)] --> M[generate_equipment_table]
+    M --> C[(out/processed/equipment.csv)]
+    A[(out/processed/pvgis_irradiance...parquet)] --> P(build_pv_production)
     C --> P
-    P -->|pv_profiles, kW| K[main.py: kW -> MW]
-    K --> T(run_digital_twin)
-    L[(load_profiles)] --> T
+    P -->|pv_profiles, kW| D(process_data)
+    D --> T(run_digital_twin)
+    L[(out/processed/load_profiles.csv)] --> D
     T --> R[verdict: vm, violations, ...]
 ```
 
@@ -30,84 +31,108 @@ MAS4TE agents supply is still being finalised with the MAS4TE team. The
 description below assumes we generate the input files from field data.
 ```
 
-## 1. Installation metadata — `generate_pv_metadata`
+## 1. Placement — the equipment table
 
-Decides **which buses carry a PV installation and of what size**, and writes
-`data/pv_installations.csv`. Placement is grouped by street (a realistic
-neighbourhood/installer effect that concentrates PV on a few feeders) rather
-than spread uniformly.
+**Where** the panels are is not decided in `pv.py`. Placement lives in
+`digital_twin/data_processing/equipment.py`, the single bus-level register that
+also carries the batteries, and is written to `out/processed/equipment.csv` (see
+[Data files](data_files.md)). `pv.py` takes that register as an input and turns
+it into power.
+
+The split matters: placement is a scenario decision about the grid, production is
+physics about the sun. Keeping placement in one register — shared with the
+battery layer — is what stops a second, independent register from drifting out
+of agreement with it and with the network.
 
 ```{code-block} python
-from sourcecode.pv_metadata import generate_pv_metadata
+from digital_twin.data_processing.equipment import generate_equipment_table
 
-pv = generate_pv_metadata(config={"n_installations": 30, "seed": 42})
+table = generate_equipment_table({"data_path": "data/bressoux",
+                                  "n_installations": 30, "seed": 42})
 ```
 
-`config` is a dict; the defaults are:
+Placement is grouped by street (a realistic neighbourhood/installer effect that
+concentrates PV on a few feeders) rather than spread uniformly. The knobs:
 
-| Key                | Default                          | Description                                              |
-|--------------------|----------------------------------|----------------------------------------------------------|
-| `n_installations`  | `30`                             | Number of residential installations to place.            |
-| `kwp_residential`  | `3.0`                            | Fixed size (kWp) of each residential installation.       |
-| `kwp_rest_home`    | `12.0`                           | Size (kWp) of the rest home, added separately.           |
-| `seed`             | `42`                             | Seed for the (reproducible) street/bus draw.             |
-| `n_streets_range`  | `(2, 4)`                         | Number of streets forming the clusters.                  |
-| `min_street_size`  | `5`                              | Minimum residential buses for a street to be eligible.   |
-| `street_weights`   | `{"Rue Ernest Malvoz": 3.0}`     | Optional per-street weighting of the draw.               |
-| `rest_home_name`   | `"Paradis du Bouhay"`            | MV node receiving the rest-home installation.            |
-| `out_path`         | `"data/pv_installations.csv"`    | Output CSV path.                                          |
+| Key                   | Default   | Description                                              |
+|-----------------------|-----------|----------------------------------------------------------|
+| `n_installations`     | `30`      | Number of residential installations to place.            |
+| `kwp_residential`     | `3.0`     | Fixed size (kWp) of each residential installation.       |
+| `mv_pv_installations` | `{}`      | PV on MV load facilities, `{name -> kWp}`.               |
+| `seed`                | `42`      | Seed for the (reproducible) street/bus draw.             |
+| `n_streets_range`     | `(2, 4)`  | Number of streets forming the clusters.                  |
+| `min_street_size`     | `5`       | Minimum residential buses for a street to be eligible.   |
+| `street_weights`      | `{}`      | Optional per-street weighting of the draw.               |
 
-**Returns** the written `pandas.DataFrame` (columns `bus_id, kwp, type, street`).
+`mv_pv_installations` is named by **role**, not by building type: what the model
+needs is "an MV load bus carrying a large array", not the fact that Bressoux's
+happens to be a rest home. A dict rather than a name/size pair, because a
+network may carry several such facilities — a school, a sports hall, a
+horticulture centre — each at its own rating. An unknown name raises, listing
+the facilities the network actually has.
+
+```{note}
+`street_weights` and `mv_pv_installations` default to **neutral** values, not to
+Bressoux's. They describe one specific neighbourhood, so the scenario passes its
+own (see `main.py`: `{"Rue Ernest Malvoz": 3.0}` and
+`{"Paradis du Bouhay": 12.0}`). Left in the module defaults they would be dead
+weight on any other site, silently matching nothing.
+```
 
 To study a higher penetration on the *same* neighbourhood, extend an existing
-park instead of drawing a fresh one — this preserves the original buses so the
-comparison isolates the effect of penetration:
+fleet instead of drawing a fresh one — this preserves the original buses so the
+comparison isolates the effect of penetration rather than mixing it with
+placement:
 
 ```{code-block} python
-from sourcecode.pv_metadata import extend_pv_metadata
+from digital_twin.data_processing.equipment import extend_pv
 
-pv50 = extend_pv_metadata(pv, n_additional=20, out_path="data/pv_installations_50.csv")
+table50 = extend_pv(table.copy(), n_additional=20, config=SCENARIO)
 ```
 
-`extend_pv_metadata(base_installations, n_additional, config=None, out_path=None)`
-keeps `base_installations` unchanged and adds `n_additional` installations,
-filling already-equipped streets first before drawing new ones.
+`extend_pv(table, n_additional, config=None, rng=None)` mutates and returns the
+table, filling already-equipped streets first before opening new ones. Pass a
+`.copy()` to keep the base fleet intact.
 
 ## 2. Irradiance → production — `build_pv_production`
 
 Turns an irradiance series into a per-installation production profile, using
-the `kwp` from the metadata. The conversion model is deliberately simple for
-v1 and isolated in a single function so it can be swapped later:
+`pv_system_size_kwp` from the equipment table. The conversion model is
+deliberately simple for v1 and isolated in a single function so it can be
+swapped later:
 
 ```{code-block} python
-from sourcecode.pv_production import build_pv_production
+from digital_twin.data_processing.equipment import load_equipment_table
+from digital_twin.data_processing.pv import build_pv_production
 import pandas as pd
 
-pv_installations = pd.read_csv("data/pv_installations.csv")
-irradiance = pd.read_parquet("data/pvgis_irradiance_quarter_hourly.parquet")
+equipment = load_equipment_table({"data_path": "data/bressoux"})
+irradiance = pd.read_parquet("data/bressoux/out/processed/pvgis_irradiance_quarter_hourly.parquet")
 
-pv_profiles_kw = build_pv_production("juin", pv_installations, irradiance)
+pv_profiles_kw = build_pv_production("juin", equipment, irradiance)
 ```
 
-| Argument           | Type                | Description                                              |
-|--------------------|---------------------|----------------------------------------------------------|
-| `mois`             | `str` or `int`      | French month name or `1`–`12`. Selects the season.       |
-| `pv_installations` | `pandas.DataFrame`  | Must contain `bus_id` and `kwp`.                         |
-| `irradiance`       | `pandas.DataFrame`  | Must contain `timestamp` and `ghi_w_m2`.                |
-| `system_factor`    | `float` (`0.8`)     | System efficiency / normalisation factor.               |
+| Argument        | Type                | Description                                                 |
+|-----------------|---------------------|-------------------------------------------------------------|
+| `mois`          | `str` or `int`      | French month name or `1`–`12`. Selects the season.          |
+| `equipment`     | `pandas.DataFrame`  | The equipment table; rows with `pv_system_size_kwp > 0` are kept. |
+| `irradiance`    | `pandas.DataFrame`  | Must contain `timestamp` and `ghi_w_m2`.                    |
+| `system_factor` | `float` (`0.8`)     | System efficiency / normalisation factor.                   |
+
+A table with no equipped row yields an **empty** frame — which is what makes
+"no PV in this scenario" expressible without a flag.
 
 **Returns** a `pandas.DataFrame` indexed `'Mon 00:00'..'Sun 23:45'` (672
-quarter-hourly steps, same layout as `load_profiles`), with columns
+quarter-hourly steps, same layout as `households`), with columns
 `pv_{bus_id}` in **kW**. The chosen calendar week is recorded in
 `out.attrs['source_week_start']`.
 
 The underlying model is `irradiance_to_power(irradiance_w_m2, kwp,
 system_factor=0.8)`, i.e. `power_kW = max(ghi, 0) / 1000 * kwp * system_factor`.
 
-```{warning}
-`build_pv_production` returns **kW**, whereas `run_digital_twin` expects
-`pv_profiles` in **MW** (same unit as `load_profiles`). The conversion is done
-by the caller — in `main.py`, `pv_profiles = build_pv_production(...) / 1000.0`.
+```{note}
+`build_pv_production` returns **kW**, the same unit `run_digital_twin` expects
+for `pv_profiles` (and `households`) -- no conversion needed by the caller.
 ```
 
 ```{warning}
@@ -123,7 +148,20 @@ self-consumption studies, replace `irradiance_to_power` with a POA/pvlib model
 
 ## 3. Consuming PV in the digital twin
 
-The produced `pv_profiles` (converted to MW) is passed to `run_digital_twin`.
+`process_data` (`digital_twin.data_processing.process_data`) wires this up
+automatically: it loads `<data_path>/out/processed/equipment.csv` together with
+the site's cached PVGIS irradiance
+(`<data_path>/out/processed/pvgis_irradiance_quarter_hourly.parquet`, see
+`build_irradiance_reference` above), calls `build_pv_production` for
+`config['mois_simule']`, and returns its kW output as `pv_profiles` directly.
+
+A scenario opts into PV by **content**: any row with `pv_system_size_kwp > 0`.
+If the table is absent or carries no PV, `pv_profiles` is `None` (loads-only)
+with nothing else needed. Activation is carried by the register rather than by
+the presence of a file, so one register describes the whole scenario and it
+cannot be half-described.
+
+The produced `pv_profiles` (kW) is passed to `run_digital_twin`.
 When present, the twin verifies temporal alignment against the loads, injects
 one `sgen` per PV column (generator convention: **positive `p_mw` =
 injection**), and runs the power flow with loads and PV together. The verdict
@@ -132,15 +170,13 @@ is the quantity that matters for PV (overvoltage), as opposed to the minimum
 voltage for load stress.
 
 ```{code-block} python
-import pandas as pd
-from sourcecode.digital_twin import run_digital_twin
+from digital_twin import run_digital_twin
+from digital_twin.data_processing.process_data import process_data
 
-households = pd.read_csv("data/households.csv")
-load_profiles = pd.read_csv("data/load_profiles.csv", index_col=0)   # MW
-# pv_profiles already in MW (see conversion above)
+config = {"data_path": "data/bressoux/"}
+metadata, network, households, pv_profiles, schedules_BSS, equipment = process_data(config)
 
-out = run_digital_twin({"load_scale": 1}, households, load_profiles,
-                       pv_profiles=pv_profiles)
+out = run_digital_twin(config, metadata, network, households, pv_profiles=pv_profiles)
 ```
 
 ```{note}
@@ -151,41 +187,46 @@ checks this before the power flow — keep that guard in place.
 
 See [Interfacing with MAS4TE](interfacing.md) for the full `run_digital_twin`
 signature and return format, and [Load assignment](load_assignment.md) for how
-`load_profiles` is produced.
+`households` is produced.
 
 ## 4. Impact analysis — multi-scenario study
 
 Beyond a single run, a ready-made **multi-scenario** study compares several PV
 penetrations. It does **not** go through `run_digital_twin`; it uses a separate
 orchestration layer (`build_base_network` / `run_pv_scenario` in
-`sourcecode/pv_injection.py`) designed to build the network once and run many
-scenarios efficiently on deep copies.
+`digital_twin/data_processing/pv.py`) designed to build the network once and run
+many scenarios efficiently on deep copies.
 
 ```{code-block} python
-from sourcecode.pv_injection import build_base_network, run_pv_scenario
+from digital_twin.data_processing.equipment import generate_equipment_table
+from digital_twin.data_processing.pv import build_base_network, run_pv_scenario
 import pandas as pd
 
-households = pd.read_csv("data/households.csv")
-pv_installations = pd.read_csv("data/pv_installations.csv")
-irradiance = pd.read_parquet("data/pvgis_irradiance_quarter_hourly.parquet")
+metadata = pd.read_csv("data/bressoux/out/processed/metadata.csv")
+equipment = generate_equipment_table(SCENARIO, write=False)
+irradiance = pd.read_parquet("data/bressoux/out/processed/pvgis_irradiance_quarter_hourly.parquet")
 
-net_base, buses, mv_nodes, validation = build_base_network()  # built once (~10-15 s)
-result = run_pv_scenario(net_base, buses, mv_nodes, households,
-                         pv_installations, irradiance,
+network = build_base_network(SCENARIO)  # built once (~10-15 s)
+result = run_pv_scenario(network, metadata, equipment, irradiance,
                          config={"mois_simule": "juin"})
 ```
 
-The script `scripts/pv_impact_analysis.py` uses this layer to compare 0 / 30 /
-50 / 80 installations (summer, plus a winter check). It reports, per
-configuration, the maximum bus voltage, the number of buses above the 1.05 pu
-and 1.10 pu limits, the location of any overvoltages, and reverse-flow
-indicators.
+This is the layer to reach for when comparing several PV penetrations (e.g.
+0 / 30 / 50 / 80 installations) over the same base network: run
+`run_pv_scenario` once per configuration and compare the returned `vm` (bus
+voltages), `line_load`/`trafo_load`, and `ext_grid_p` (reverse flow) across
+runs.
+
+Nested fleets are built **in place** with `extend_pv` on every run, so the
+50-fleet provably contains the 30-fleet and no stored file can drift out of sync
+with the network.
 
 ```{note}
 `run_pv_scenario` and `build_base_network` are **analysis tooling only** — the
 nominal way to simulate with PV is `run_digital_twin(..., pv_profiles=...)`
-(section 3). The injection primitives themselves live in `digital_twin.py`;
-`pv_injection.py` imports them and adds the multi-scenario orchestration.
+(section 3). The injection primitives themselves live in
+`digital_twin/digital_twin.py`; `data_processing/pv.py` imports them and adds
+the multi-scenario orchestration.
 ```
 
 ```{note}
@@ -201,8 +242,8 @@ the number of installations.
 The data files consumed above are produced by:
 
 ```{code-block} bash
-python -m sourcecode.consumption_bank   # bank + PVGIS irradiance parquets
-python -m sourcecode.pv_metadata        # data/pv_installations.csv
+python -m digital_twin.data_processing.profiles   # bank + PVGIS irradiance parquets
+python -c "from digital_twin.data_processing.equipment import generate_equipment_table; generate_equipment_table({'data_path': 'data/bressoux'})"
 ```
 
 See [Data files](data_files.md) for the exact schema of each file.
