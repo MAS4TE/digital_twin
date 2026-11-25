@@ -830,10 +830,14 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None,
     ow.log_variable('res_bus', 'vm_pu')
     ow.log_variable('res_line', 'loading_percent')
     ow.log_variable('res_trafo', 'loading_percent')
-    if with_pv:
+    # The flow series are needed for reverse-flow checks with PV, and always when
+    # the caller exports them -- so the exported keys do not depend on the layers.
+    log_flows = with_pv or bool(config.get('export_powerflow'))
+    if log_flows:
         ow.log_variable('res_line', 'p_from_mw')     # sign: flow direction (reverse flows)
         ow.log_variable('res_trafo', 'p_hv_mw')      # sign: <0 = reverse HV->LV flow on this transformer
         ow.log_variable('res_ext_grid', 'p_mw')      # sign: <0 = network exports upstream
+    if with_pv:
         ow.log_variable('res_sgen', 'p_mw')
     if with_bss:
         ow.log_variable('res_storage', 'p_mw')       # sign: >0 = charging
@@ -846,10 +850,11 @@ def _run_powerflow(net, df_profiles_p, df_profiles_q, config, df_pv_p=None,
         'line_load': ow.output['res_line.loading_percent'],
         'trafo_load': ow.output['res_trafo.loading_percent'],
     }
-    if with_pv:
+    if log_flows:
         out['line_p_from'] = ow.output['res_line.p_from_mw']
         out['trafo_p_hv'] = ow.output['res_trafo.p_hv_mw']
         out['ext_grid_p'] = ow.output['res_ext_grid.p_mw']
+    if with_pv:
         out['sgen_p_out'] = ow.output['res_sgen.p_mw']
     if with_bss:
         out['storage_p'] = ow.output['res_storage.p_mw']
@@ -1114,6 +1119,22 @@ def run_digital_twin(config, metadata, network, households,
     -------
     out : pd.DataFrame
         Long-format result: summary (verdict) + violations + warnings.
+    powerflow : dict of pd.DataFrame
+        ONLY when config['export_powerflow'] is True -- the call then returns
+        the tuple (out, powerflow). The full time series of the run, each frame
+        indexed by the step 0..n_timesteps-1, columns = pandapower element
+        indices (net.bus / net.line / net.trafo / ... index):
+          'vm'          bus voltage, pu
+          'line_load'   line loading, %
+          'trafo_load'  transformer loading, %
+          'line_p_from' line active power at from_bus, MW; > 0 = flow from from_bus
+          'trafo_p_hv'  transformer active power at the HV side, MW; < 0 = reverse flow
+          'ext_grid_p'  external grid active power, MW; < 0 = network exports upstream
+          'sgen_p_out'  PV output, MW (only with pv_profiles)
+          'storage_p'   applied storage power, MW; > 0 = charging (only with schedules_BSS)
+        Returned beside `out`, not as long-format rows (346 buses x 672 steps
+        alone would be 230k rows), and not in out.attrs, which pd.concat
+        compares and cannot compare when it holds DataFrames.
     """
     # Loud guard rail: these three keys used to be how a caller sized/placed the
     # central battery; they are now a data fact (equipment.csv), generated once
@@ -1209,4 +1230,6 @@ def run_digital_twin(config, metadata, network, households,
     if cfg['verbose']:
         _print_results_info(out, warnings)
 
+    if cfg.get('export_powerflow'):
+        return out, pf
     return out

@@ -28,6 +28,34 @@ time-series (voltages, loadings, ...) together with any warnings raised
 during the simulation (e.g. households that could not be matched to a
 street/substation).
 
+**Power-flow time series (opt-in).** With `config['export_powerflow'] = True`,
+the call returns a tuple instead:
+
+```{code-block} python
+out, pf = run_digital_twin({**config, "export_powerflow": True}, metadata, network,
+                           households, pv_profiles=pv_profiles,
+                           schedules_BSS=schedules_BSS, equipment=equipment)
+```
+
+`pf` is a dict of DataFrames, each indexed by the step `0..n_timesteps-1`
+(672 for a week), with one column per pandapower element, named by its index
+in `net.bus`, `net.line`, ...:
+
+| Key           | Element      | Unit | Sign                                         |
+|---------------|--------------|------|----------------------------------------------|
+| `vm`          | bus          | pu   |                                              |
+| `line_load`   | line         | %    |                                              |
+| `trafo_load`  | transformer  | %    |                                              |
+| `line_p_from` | line         | MW   | > 0 = flow from `from_bus` towards `to_bus`  |
+| `trafo_p_hv`  | transformer  | MW   | < 0 = reverse flow (towards the HV side)     |
+| `ext_grid_p`  | external grid| MW   | < 0 = the network exports upstream           |
+| `sgen_p_out`  | PV `sgen`    | MW   | only when `pv_profiles` is given             |
+| `storage_p`   | `storage`    | MW   | > 0 = charging; only with `schedules_BSS`    |
+
+`storage_p` is the power actually applied, after clipping when
+`bss_enforce_limits` is set. The series are returned beside `out` rather than as
+long-format rows: 346 buses × 672 steps alone would be 230k rows.
+
 ### The `schedules_BSS` input
 
 The schedule of the **battery fleet**, in **long** format: the index is the time

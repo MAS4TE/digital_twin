@@ -202,6 +202,7 @@ def _config_to_dict(config):
         'bss_soc_min': BSS_SOC_MIN_FRAC,       # lower SoC bound (unusable reserve), fraction
         'bss_c_rate': None,                   # None -> DERIVED from the park, see bss_c_rate()
         'export_bss_soc': False,              # opt-in per-battery SoC timeseries export
+        'export_powerflow': False,            # opt-in: also return the power-flow time series (see run_digital_twin)
         'verbose': False,                     # print scenario/result info + progress bar during the run
     }
     cfg = dict(defaults) if config is None else {**defaults, **config}
