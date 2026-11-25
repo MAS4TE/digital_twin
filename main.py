@@ -12,6 +12,9 @@ config = {
         # by bressoux_setup.ipynb: "data/bressoux/scenarios/low" (today's
         # baseline, no synthetic assets), ".../high" (heavier electrification),
         # or the base "data/bressoux" scenario itself.
+        # Second site: "data/heerlerheide" (Heerlen, NL), built by
+        # data/heerlerheide/heerlerheide_setup.ipynb -- use 'trafo_sn_mva': 0.4
+        # and 'mois_simule': 1 with it (the month its profiles were drawn for).
         'data_path': "data/bressoux/scenarios/medium",  # scenario folder (inputs/network.py, out/processed/{equipment,metadata,load_profiles}.csv, ...)
         'mois_simule': 6,                               # target month of the bank (1-12).
         'n_timesteps': 7 * 24 * 4,                      # number of timesteps in the simulation (7*24*4 for a week of 15-min intervals)

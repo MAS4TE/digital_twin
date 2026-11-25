@@ -110,6 +110,8 @@ BSS_CENTRAL_ID = 'b0'
 # reference schedule generator (data_processing.bss). Defined HERE rather than in
 # either of them because both must plan and simulate against the same band: two
 # copies drifting apart would raise [BSS/soc] warnings on feasible schedules.
+# These are only the DEFAULTS of config['bss_soc_min'] / config['bss_soc_init'];
+# both modules read the config keys, so one override moves both together.
 BSS_SOC_MIN_FRAC = 0.1    # unusable reserve: min_e_mwh = 10% of capacity
 BSS_SOC_INIT = 0.5        # state of charge at step 0
 
@@ -196,6 +198,8 @@ def _config_to_dict(config):
         # activation-by-presence idiom as pv_profiles.
         'bss_eta': 0.95,                       # one-way efficiency, 1.0 = lossless
         'bss_enforce_limits': True,           # clip the schedule to the power and SoC limits
+        'bss_soc_init': BSS_SOC_INIT,          # SoC at step 0, fraction of capacity
+        'bss_soc_min': BSS_SOC_MIN_FRAC,       # lower SoC bound (unusable reserve), fraction
         'bss_c_rate': None,                   # None -> DERIVED from the park, see bss_c_rate()
         'export_bss_soc': False,              # opt-in per-battery SoC timeseries export
         'verbose': False,                     # print scenario/result info + progress bar during the run

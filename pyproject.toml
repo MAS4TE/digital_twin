@@ -17,6 +17,7 @@ dependencies = [
     "pyarrow",
     "pvlib",
     "folium",
+    "geopandas",   # site network builders reading GIS data (data/heerlerheide/inputs/network.py)
 ]
 
 [project.optional-dependencies]

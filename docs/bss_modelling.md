@@ -148,8 +148,11 @@ Two properties make the result usable rather than merely plausible:
   the battery a little every day.
 
 The SoC walk on top caps power by the room left in the
-`[BSS_SOC_MIN_FRAC, 1.0]` band — the *same* band the engine enforces, imported
-from `utils` rather than restated, so a schedule built here is feasible there.
+`[config['bss_soc_min'], 1.0]` band, starting at `config['bss_soc_init']` —
+the *same* keys the engine reads, so a schedule built here is feasible there.
+They default to 0.1 and 0.5 (`utils.BSS_SOC_MIN_FRAC` / `BSS_SOC_INIT`). Set
+both to 0 to match a market model that starts the batteries empty and uses
+their full capacity.
 
 ## 3. The `schedules_BSS` format
 
@@ -196,7 +199,8 @@ Two contracts are enforced in `_validate_inputs`, both as **errors**:
    pandapower does not update `soc_percent` during a time-series run. Per
    battery rather than fleet-wide because the capacities differ by two orders of
    magnitude: a fleet-level SoC would let the park's headroom mask a domestic
-   battery driven flat.
+   battery driven flat. Each walk starts at `config['bss_soc_init']` and stays
+   within `[config['bss_soc_min'], 1.0]`.
 4. `_inject_bss_storage` — creates one `storage` element per battery, on its own
    bus, `b0` and `b1`…`bn` through the same loop.
 5. `_run_powerflow` — drives each storage through a `ConstControl`, exactly as

@@ -63,8 +63,8 @@ import pandapower as pp
 from pandapower.control import ConstControl
 from pandapower.timeseries import DFData, OutputWriter, run_timeseries
 
-from .utils import (BSS_CENTRAL_ID, BSS_SIZE_COLUMN, BSS_SOC_INIT,
-                    BSS_SOC_MIN_FRAC, BUS_DOMAIN_EQUIPABLE, BUS_DOMAIN_LV,
+from .utils import (BSS_CENTRAL_ID, BSS_SIZE_COLUMN,
+                    BUS_DOMAIN_EQUIPABLE, BUS_DOMAIN_LV,
                     BUS_DOMAIN_MV_NODE, STEPS_PER_DAY, _config_to_dict,
                     _normalize_month, bss_c_rate, bss_register, check_bus_ids)
 
@@ -324,6 +324,16 @@ def _validate_inputs(config, metadata, network, households, pv_profiles, schedul
         if not (0 < config['bss_eta'] <= 1):
             raise ValueError(
                 f"config['bss_eta'] ({config['bss_eta']}) must be in (0, 1]."
+            )
+        soc_min, soc_init = float(config['bss_soc_min']), float(config['bss_soc_init'])
+        if not (0 <= soc_min < 1):
+            raise ValueError(
+                f"config['bss_soc_min'] ({soc_min}) must be in [0, 1)."
+            )
+        if not (soc_min <= soc_init <= 1):
+            raise ValueError(
+                f"config['bss_soc_init'] ({soc_init}) must be in "
+                f"[bss_soc_min ({soc_min}), 1]."
             )
 
     return warnings
@@ -686,10 +696,13 @@ def _read_bss_schedule(schedules_BSS, df_load_p, config, specs, load_time_index=
 #  Same split as the PV layer above: the elements are created here, their
 #  per-timestep power is applied by ConstControls in _run_powerflow.
 # ============================================================
-def _inject_bss_storage(net, specs):
-    """Create ONE storage element per battery of `specs`, each on its own bus.
+def _inject_bss_storage(net, specs, config):
+    """Create ONE storage element per battery of `specs`, each on its own bus,
+    with the SoC band and initial SoC of config['bss_soc_min'/'bss_soc_init'].
     """
     net.storage = net.storage.iloc[0:0]
+    soc_min = float(config['bss_soc_min'])
+    soc_init = float(config['bss_soc_init'])
 
     storage_bus = {}
     for battery_id, spec in specs.items():
@@ -697,19 +710,21 @@ def _inject_bss_storage(net, specs):
         max_p_mw = float(spec['p_max_kw']) / 1000.0
         idx = pp.create_storage(
             net, bus=int(spec['bus_id']), p_mw=0.0,
-            max_e_mwh=max_e_mwh, min_e_mwh=BSS_SOC_MIN_FRAC * max_e_mwh,
+            max_e_mwh=max_e_mwh, min_e_mwh=soc_min * max_e_mwh,
             max_p_mw=max_p_mw, min_p_mw=-max_p_mw, sn_mva=max_p_mw,
-            soc_percent=100.0 * BSS_SOC_INIT, name=_bss_storage_name(battery_id),
+            soc_percent=100.0 * soc_init, name=_bss_storage_name(battery_id),
         )
         storage_bus[idx] = int(spec['bus_id'])
     return storage_bus
 
 
-def _track_one_soc(p_mw, e_max_mwh, config, soc_init=BSS_SOC_INIT):
-    """Integrate ONE battery's schedule into its state of charge, step by step.
+def _track_one_soc(p_mw, e_max_mwh, config):
+    """Integrate ONE battery's schedule into its state of charge, step by step,
+    from config['bss_soc_init'] within [config['bss_soc_min'], 1.0].
     """
     dt_h = 24.0 / STEPS_PER_DAY
-    e_min_mwh = BSS_SOC_MIN_FRAC * e_max_mwh
+    soc_init = float(config['bss_soc_init'])
+    e_min_mwh = float(config['bss_soc_min']) * e_max_mwh
     eta = float(config['bss_eta'])
     enforce = bool(config['bss_enforce_limits'])
 
@@ -740,7 +755,7 @@ def _track_one_soc(p_mw, e_max_mwh, config, soc_init=BSS_SOC_INIT):
     return soc, p_applied, n_out, worst_step, worst_soc
 
 
-def _track_bss_soc(df_bss_p, specs, config, soc_init=BSS_SOC_INIT):
+def _track_bss_soc(df_bss_p, specs, config):
     """Track EACH battery's own state of charge over the fleet.
     """
     soc_columns, applied_columns, breaches = {}, {}, []
@@ -749,7 +764,7 @@ def _track_bss_soc(df_bss_p, specs, config, soc_init=BSS_SOC_INIT):
         col = _bss_storage_name(battery_id)
         soc, p_applied, n_out, worst_step, worst_soc = _track_one_soc(
             df_bss_p[col].to_numpy(dtype=float), float(spec['e_kwh']) / 1000.0,
-            config, soc_init=soc_init)
+            config)
         soc_columns[col] = soc
         applied_columns[col] = p_applied
         if n_out:
@@ -764,7 +779,7 @@ def _track_bss_soc(df_bss_p, specs, config, soc_init=BSS_SOC_INIT):
         n_steps = len(df_bss_p)
         warnings.append(
             f"[BSS/soc] {len(breaches)} of {len(specs)} batteries leave the "
-            f"[{100 * BSS_SOC_MIN_FRAC:.0f}%, 100%] band -- worst case {worst[0]} "
+            f"[{100 * float(config['bss_soc_min']):.0f}%, 100%] band -- worst case {worst[0]} "
             f"({worst[4]:.1f} kWh): {worst[1]} of {n_steps} steps out of band, down to "
             f"{100 * worst[3]:.1f}% at step {worst[2]}. Schedule inconsistent with the "
             "capacity of these batteries"
@@ -1158,7 +1173,7 @@ def run_digital_twin(config, metadata, network, households,
         df_bss_soc, df_bss_p, w_soc = _track_bss_soc(df_bss_p, bss_specs, cfg)
         warnings += w_soc
 
-        _inject_bss_storage(net, bss_specs)
+        _inject_bss_storage(net, bss_specs, cfg)
 
     pf = _run_powerflow(net, df_p, df_q, cfg, df_pv_p=df_pv_p, df_bss_p=df_bss_p)
     vm, line_load, trafo_load = pf['vm'], pf['line_load'], pf['trafo_load']

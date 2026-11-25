@@ -102,7 +102,8 @@ def _pv_kw(pv_profiles, bus_id, n_steps):
     return pv_profiles[col].to_numpy(dtype=float)[:n_steps]
 
 
-def _schedule_one_battery(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta):
+def _schedule_one_battery(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta,
+                          soc_min=BSS_SOC_MIN_FRAC, soc_init=BSS_SOC_INIT):
     """Greedy self-consumption + peak-shaving schedule for ONE battery.
 
     Per day, the battery charges when its net load sits in the low quantile (PV
@@ -117,9 +118,9 @@ def _schedule_one_battery(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta)
     meter-side kWh instead ignores the round-trip loss and drains the battery a
     little every day.
 
-    The SoC walk on top caps power by the room left in [BSS_SOC_MIN_FRAC, 1.0] --
-    the SAME band the engine enforces, imported rather than restated, so a
-    schedule built here is feasible there.
+    The SoC walk on top caps power by the room left in [soc_min, 1.0], starting
+    at soc_init -- build_bss_schedule passes config['bss_soc_min'/'bss_soc_init'],
+    the SAME keys the engine reads, so a schedule built here is feasible there.
 
     Returns
     -------
@@ -130,8 +131,8 @@ def _schedule_one_battery(p_net_kw, e_kwh, p_max_kw, q_charge, q_discharge, eta)
     dt_h = 24.0 / STEPS_PER_DAY
 
     e_max = float(e_kwh)
-    e_min = BSS_SOC_MIN_FRAC * e_max
-    e = BSS_SOC_INIT * e_max
+    e_min = soc_min * e_max
+    e = soc_init * e_max
 
     for start in range(0, n, STEPS_PER_DAY):
         day = p_net_kw[start:start + STEPS_PER_DAY]
@@ -194,7 +195,7 @@ def build_bss_schedule(households, pv_profiles, equipment, metadata=None, config
         load of ITS OWN bus. Without it, every battery falls back to the pool
         mean and plans against a load its bus will never see.
     config : dict or None
-        Reads bss_c_rate, bss_eta, q_charge, q_discharge. `bss_eta` is the SAME
+        Reads bss_c_rate, bss_eta, bss_soc_min, bss_soc_init, q_charge, q_discharge. `bss_eta` is the SAME
         key the engine uses -- planning against a different efficiency than the
         twin applies is what makes a schedule drift.
 
@@ -222,6 +223,7 @@ def build_bss_schedule(households, pv_profiles, equipment, metadata=None, config
     bus_load = _bus_load_lookup(households, metadata)
     n_steps = len(mean_load_kw)
     eta = float(cfg['bss_eta'])
+    soc_band = dict(soc_min=float(cfg['bss_soc_min']), soc_init=float(cfg['bss_soc_init']))
     q_charge, q_discharge = cfg['q_charge'], cfg['q_discharge']
 
     series = {}
@@ -254,7 +256,7 @@ def build_bss_schedule(households, pv_profiles, equipment, metadata=None, config
                      if pv_profiles is not None else np.zeros(n_steps, dtype=float))
         series[BSS_CENTRAL_ID] = _schedule_one_battery(
             agg_load_kw - agg_pv_kw, central['e_kwh'], central['p_max_kw'],
-            q_charge, q_discharge, eta)
+            q_charge, q_discharge, eta, **soc_band)
 
     # A domestic battery's rating follows the central battery's C-rate (see
     # utils.bss_c_rate), keeping the fleet one technology at two scales -- or an
@@ -269,7 +271,7 @@ def build_bss_schedule(households, pv_profiles, equipment, metadata=None, config
         own_load_kw = bus_load.get(int(entry['bus_id']), mean_load_kw)[:n_steps]
         p_net_kw = own_load_kw - _pv_kw(pv_profiles, entry['bus_id'], n_steps)
         series[battery_id] = _schedule_one_battery(
-            p_net_kw, e_kwh, e_kwh * c_rate, q_charge, q_discharge, eta)
+            p_net_kw, e_kwh, e_kwh * c_rate, q_charge, q_discharge, eta, **soc_band)
 
     index = _WEEK_TIME_INDEX[:n_steps] if n_steps <= STEPS_PER_WEEK else range(n_steps)
     return pd.concat([

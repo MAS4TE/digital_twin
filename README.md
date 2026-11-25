@@ -169,6 +169,32 @@ Once the generated files exist, only step 2 needs to be repeated for
 day-to-day runs; steps 1, 3 and 4 are one-off (re-run them only if the
 sources change).
 
+## Second site: Heerlerheide (Heerlen, NL)
+
+`data/heerlerheide/` reuses the same engine on a Dutch neighbourhood: 3 real
+MV/LV stations and their ~740 LV connections, north of the Vrieheide park. The
+network is built from the Enexis Open Asset Data (CC0):
+
+- **Real**: the MV/LV stations, the LV cable routes and their feeder ids
+  (`Kabelgroep`), the LV cabinets, the house connections and their tap
+  points, and the 10 kV route from the HV/MV station (HUSK) -- with real
+  cable lengths. OSM addresses (`inputs/coordinates.csv`) label each
+  connection with a street/number.
+- **Assumed**: radial operation (each cable joint fed by its closest station,
+  as the open points are not published), the cable and transformer types
+  (400 kVA, 10/0.4 kV), the slack voltage, and the load profiles (Bressoux
+  bank of real weeks rescaled to the Dutch average of 2,450 kWh/yr).
+
+The twin only reads `inputs/enexis_light/` (a 5 x 5 km, ~45 MB GeoPackage cut
+once from the ~10 GB Enexis download by
+`data/heerlerheide/extract_enexis_light.py`; see its `README.md`). All
+parameters, including the site perimeter `SITE_BBOX_RD`, are constants at the
+top of `data/heerlerheide/inputs/network.py`. It needs `geopandas`, now a
+package dependency.
+To build the scenario, visualize the grid and run a baseline power
+flow, run `data/heerlerheide/heerlerheide_setup.ipynb` in Jupyter (it moves
+itself to the repository root, whatever the kernel's start folder).
+
 ## Repository layout
 
 - `digital_twin/` — the network-agnostic engine (`digital_twin.py`,
